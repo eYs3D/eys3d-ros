@@ -1,0 +1,230 @@
+# G100+i video-mode catalogue.
+#
+# G100+i shares hardware and firmware with G100+ but exposes only the
+# 1280x720 resolution group. Mode IDs are preserved from the G100+
+# catalogue so the same mode_id selects the same logical configuration
+# on either variant; modes outside the 1280x720 resolution group are
+# not exposed here.
+#
+# Usage:
+#   ros2 launch eys3d_camera G100Pi.launch.py mode_id:=<id>
+#
+# Camera:
+#   USB 3.2 Gen1 depth camera with a USB 2.0 fallback path. 1280x720 mono
+#   sensor pair. Depth is 14-bit distance in millimetres.
+#
+# Mode schema (every field is required on every entry):
+#   color.w / color.h     pixel resolution (0/0 = color stream off)
+#   color.fmt             0 = raw YUYV, 1 = MJPEG
+#   color.split_lr        true when the wire frame carries L|R side-by-side
+#   depth.w / depth.h     pixel resolution (0/0 = depth stream off)
+#   depth.dtype           eSPDI APC_DEPTH_DATA_* code (14-bit distance variants)
+#   zd_index              rectify-LUT row for the active resolution group
+#   fps                   physical frame rate
+#   interleave            true = SDK splits color/depth from a unified stream
+#                         (effective per-stream rate is fps / 2)
+
+model: G100Pi
+
+modes:
+  # === L'+D 1280x720 ===
+  1:
+    name: "L'+D 1280x720@60 interleave (SDK 30fps)"
+    color: {w: 1280, h: 720, fmt: 0, split_lr: false}
+    depth: {w: 1280, h: 720, dtype: 18}
+    zd_index: 0
+    fps: 60
+    interleave: true
+  2:
+    name: "L'+D 1280x720@60"
+    color: {w: 1280, h: 720, fmt: 0, split_lr: false}
+    depth: {w: 1280, h: 720, dtype:  2}
+    zd_index: 0
+    fps: 60
+    interleave: false
+  3:
+    name: "L'+D 1280x720@30 interleave (SDK 15fps)"
+    color: {w: 1280, h: 720, fmt: 0, split_lr: false}
+    depth: {w: 1280, h: 720, dtype: 18}
+    zd_index: 0
+    fps: 30
+    interleave: true
+  4:
+    name: "L'+D 1280x720@30"
+    color: {w: 1280, h: 720, fmt: 0, split_lr: false}
+    depth: {w: 1280, h: 720, dtype:  2}
+    zd_index: 0
+    fps: 30
+    interleave: false
+  5:
+    name: "L'+D 1280x720@20 interleave (SDK 10fps)"
+    color: {w: 1280, h: 720, fmt: 0, split_lr: false}
+    depth: {w: 1280, h: 720, dtype: 18}
+    zd_index: 0
+    fps: 20
+    interleave: true
+  6:
+    name: "L'+D 1280x720@10"
+    color: {w: 1280, h: 720, fmt: 0, split_lr: false}
+    depth: {w: 1280, h: 720, dtype:  2}
+    zd_index: 0
+    fps: 10
+    interleave: false
+
+  # === L'+D 1280x720 color + 640x360 scale-down depth ===
+  19:
+    name: "L'+D 1280x720 color + 640x360 depth scale-down @60 interleave (SDK 30fps)"
+    color: {w: 1280, h: 720, fmt: 0, split_lr: false}
+    depth: {w:  640, h: 360, dtype: 50}
+    zd_index: 0
+    fps: 60
+    interleave: true
+  20:
+    name: "L'+D 1280x720 color + 640x360 depth scale-down @30 interleave (SDK 15fps)"
+    color: {w: 1280, h: 720, fmt: 0, split_lr: false}
+    depth: {w:  640, h: 360, dtype: 50}
+    zd_index: 0
+    fps: 30
+    interleave: true
+  21:
+    name: "L'+D 1280x720 color + 640x360 depth scale-down @20 interleave (SDK 10fps)"
+    color: {w: 1280, h: 720, fmt: 0, split_lr: false}
+    depth: {w:  640, h: 360, dtype: 50}
+    zd_index: 0
+    fps: 20
+    interleave: true
+
+  # === L'+R'+D wide ===
+  22:
+    name: "L'+R'+D 1280(x2)x720@10 + 720p depth"
+    color: {w: 2560, h: 720, fmt: 0, split_lr: true}
+    depth: {w: 1280, h: 720, dtype: 2}
+    zd_index: 0
+    fps: 10
+    interleave: false
+
+  # === L+R+D wide ===
+  23:
+    name: "L+R+D 1280(x2)x720@30 + 720p depth"
+    color: {w: 2560, h: 720, fmt: 0, split_lr: true}
+    depth: {w: 1280, h: 720, dtype: 7}
+    zd_index: 0
+    fps: 30
+    interleave: false
+  24:
+    name: "L+R+D 1280(x2)x720@10 + 720p depth"
+    color: {w: 2560, h: 720, fmt: 0, split_lr: true}
+    depth: {w: 1280, h: 720, dtype: 7}
+    zd_index: 0
+    fps: 10
+    interleave: false
+
+  # === D-only 1280x720 ===
+  25:
+    name: "D-only 1280x720@60"
+    color: {w: 0, h: 0, fmt: 1, split_lr: false}
+    depth: {w: 1280, h: 720, dtype: 2}
+    zd_index: 0
+    fps: 60
+    interleave: false
+  26:
+    name: "D-only 1280x720@30"
+    color: {w: 0, h: 0, fmt: 1, split_lr: false}
+    depth: {w: 1280, h: 720, dtype: 2}
+    zd_index: 0
+    fps: 30
+    interleave: false
+  27:
+    name: "D-only 1280x720@15"
+    color: {w: 0, h: 0, fmt: 1, split_lr: false}
+    depth: {w: 1280, h: 720, dtype: 2}
+    zd_index: 0
+    fps: 15
+    interleave: false
+  28:
+    name: "D-only 1280x720@10"
+    color: {w: 0, h: 0, fmt: 1, split_lr: false}
+    depth: {w: 1280, h: 720, dtype: 2}
+    zd_index: 0
+    fps: 10
+    interleave: false
+
+  # === L'+R' wide 1280x720 ===
+  40:
+    name: "L'+R' 1280(x2)x720@60"
+    color: {w: 2560, h: 720, fmt: 0, split_lr: true}
+    depth: {w: 0, h: 0, dtype: 5}
+    zd_index: 0
+    fps: 60
+    interleave: false
+  41:
+    name: "L'+R' 1280(x2)x720@30"
+    color: {w: 2560, h: 720, fmt: 0, split_lr: true}
+    depth: {w: 0, h: 0, dtype: 5}
+    zd_index: 0
+    fps: 30
+    interleave: false
+  42:
+    name: "L'+R' 1280(x2)x720@15"
+    color: {w: 2560, h: 720, fmt: 0, split_lr: true}
+    depth: {w: 0, h: 0, dtype: 5}
+    zd_index: 0
+    fps: 15
+    interleave: false
+  43:
+    name: "L'+R' 1280(x2)x720@10"
+    color: {w: 2560, h: 720, fmt: 0, split_lr: true}
+    depth: {w: 0, h: 0, dtype: 5}
+    zd_index: 0
+    fps: 10
+    interleave: false
+
+  # === USB 2.0 L'+D 1280x720 ===
+  55:
+    name: "L'+D 1280x720@10 (USB 2.0)"
+    color: {w: 1280, h: 720, fmt: 1, split_lr: false}
+    depth: {w: 1280, h: 720, dtype: 2}
+    zd_index: 0
+    fps: 10
+    interleave: false
+  56:
+    name: "L'+D 1280x720@24 + 640x360 depth interleave (USB 2.0, SDK 12fps)"
+    color: {w: 1280, h: 720, fmt: 1, split_lr: false}
+    depth: {w:  640, h: 360, dtype: 50}
+    zd_index: 0
+    fps: 24
+    interleave: true
+  57:
+    name: "L'+D 1280x720@20 + 640x360 depth interleave (USB 2.0, SDK 10fps)"
+    color: {w: 1280, h: 720, fmt: 1, split_lr: false}
+    depth: {w:  640, h: 360, dtype: 50}
+    zd_index: 0
+    fps: 20
+    interleave: true
+
+  # === USB 2.0 D-only 1280x720 ===
+  64:
+    name: "D-only 1280x720@10 (USB 2.0)"
+    color: {w: 0, h: 0, fmt: 1, split_lr: false}
+    depth: {w: 1280, h: 720, dtype: 2}
+    zd_index: 0
+    fps: 10
+    interleave: false
+
+  # === USB 2.0 L'+R' wide 1280x720 ===
+  75:
+    name: "L'+R' 1280(x2)x720@2 (USB 2.0)"
+    color: {w: 2560, h: 720, fmt: 0, split_lr: true}
+    depth: {w: 0, h: 0, dtype: 5}
+    zd_index: 0
+    fps: 2
+    interleave: false
+
+  # === L+R wide ===
+  80:
+    name: "L+R 1280(x2)x720@30"
+    color: {w: 2560, h: 720, fmt: 0, split_lr: true}
+    depth: {w: 0, h: 0, dtype: 0}
+    zd_index: 0
+    fps: 30
+    interleave: false

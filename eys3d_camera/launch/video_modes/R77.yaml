@@ -1,0 +1,95 @@
+# R77 video-mode catalogue.
+# Source: YMS023_R77-A Datasheet Rev 0.6 (2025-02-26), Table 4.1.
+#
+# Usage:
+#   ros2 launch eys3d_camera R77.launch.py mode_id:=<id>
+#
+# Camera:
+#   USB 2.0 depth camera, 1280x920 sensor. Depth is 14-bit distance in
+#   millimetres.
+#
+# Mode schema (every field is required on every entry):
+#   color.w / color.h     pixel resolution (0/0 = color stream off)
+#   color.fmt             0 = raw YUYV, 1 = MJPEG
+#   color.split_lr        true when the wire frame carries L|R side-by-side
+#   depth.w / depth.h     pixel resolution (0/0 = depth stream off)
+#   depth.dtype           eSPDI APC_DEPTH_DATA_* code (14-bit distance variants)
+#   zd_index              rectify-LUT row for the active resolution group
+#   fps                   physical frame rate
+#   interleave            true = SDK splits color/depth from a unified stream
+#                         (effective per-stream rate is fps / 2)
+
+model: R77
+
+modes:
+  1:
+    name: "L'+D 1280x920@7"
+    color: {w: 1280, h: 920, fmt: 1, split_lr: false}
+    depth: {w: 1280, h: 920, dtype: 2}
+    zd_index: 0
+    fps: 7
+    interleave: false
+
+  2:
+    name: "L'+D 1280x920@30 + 640x460 depth"
+    color: {w: 1280, h: 920, fmt: 1, split_lr: false}
+    depth: {w:  640, h: 460, dtype: 34}
+    zd_index: 0
+    fps: 30
+    interleave: false
+
+  3:
+    name: "L'+D 1280x920@15 + 640x460 depth"
+    color: {w: 1280, h: 920, fmt: 1, split_lr: false}
+    depth: {w:  640, h: 460, dtype: 34}
+    zd_index: 0
+    fps: 15
+    interleave: false
+
+  4:
+    name: "D-only 640x460@30"
+    color: {w: 0, h: 0, fmt: 1, split_lr: false}
+    depth: {w: 640, h: 460, dtype: 34}
+    zd_index: 0
+    fps: 30
+    interleave: false
+
+  5:
+    name: "D-only 640x460@15"
+    color: {w: 0, h: 0, fmt: 1, split_lr: false}
+    depth: {w: 640, h: 460, dtype: 34}
+    zd_index: 0
+    fps: 15
+    interleave: false
+
+  6:
+    name: "L'+R'+D 1280(x2)x920@6 + 1280x920 depth"
+    color: {w: 2560, h: 920, fmt: 1, split_lr: true}
+    depth: {w: 1280, h: 920, dtype: 2}
+    zd_index: 0
+    fps: 6
+    interleave: false
+
+  7:
+    name: "L'+R'+D 1280(x2)x920@15 + 640x460 depth"
+    color: {w: 2560, h: 920, fmt: 1, split_lr: true}
+    depth: {w:  640, h: 460, dtype: 34}
+    zd_index: 0
+    fps: 15
+    interleave: false
+
+  8:
+    name: "L+R 1280(x2)x920@4"
+    color: {w: 2560, h: 920, fmt: 0, split_lr: true}
+    depth: {w: 0, h: 0, dtype: 0}
+    zd_index: 0
+    fps: 4
+    interleave: false
+
+  9:
+    name: "L'+R' 1280(x2)x920@4"
+    color: {w: 2560, h: 920, fmt: 0, split_lr: true}
+    depth: {w: 0, h: 0, dtype: 5}
+    zd_index: 0
+    fps: 4
+    interleave: false

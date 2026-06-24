@@ -1,0 +1,149 @@
+# G62 video-mode catalogue.
+# Source: YMS025_G62 Datasheet Rev 0.6 (2025-02-26), Table 4.1.
+#
+# Usage:
+#   ros2 launch eys3d_camera G62.launch.py mode_id:=<id>
+#
+# Camera:
+#   USB 2.0 monochrome depth module, 640x480 mono sensor pair. Depth is
+#   14-bit distance in millimetres.
+#
+# Mode schema (every field is required on every entry):
+#   color.w / color.h     pixel resolution (0/0 = color stream off)
+#   color.fmt             0 = raw YUYV, 1 = MJPEG
+#   color.split_lr        true when the wire frame carries L|R side-by-side
+#   depth.w / depth.h     pixel resolution (0/0 = depth stream off)
+#   depth.dtype           eSPDI APC_DEPTH_DATA_* code (14-bit distance variants)
+#   zd_index              rectify-LUT row for the active resolution group
+#   fps                   physical frame rate
+#   interleave            true = SDK splits color/depth from a unified stream
+#                         (effective per-stream rate is fps / 2)
+
+model: G62
+
+modes:
+  1:
+    name: "L'+D 640x480@25"
+    color: {w: 640, h: 480, fmt: 1, split_lr: false}
+    depth: {w: 640, h: 480, dtype: 2}
+    zd_index: 2
+    fps: 25
+    interleave: false
+
+  2:
+    name: "L'+D 640x480@10"
+    color: {w: 640, h: 480, fmt: 1, split_lr: false}
+    depth: {w: 640, h: 480, dtype: 2}
+    zd_index: 2
+    fps: 10
+    interleave: false
+
+  3:
+    name: "L'+D 320x240@30"
+    color: {w: 320, h: 240, fmt: 1, split_lr: false}
+    depth: {w: 320, h: 240, dtype: 2}
+    zd_index: 3
+    fps: 30
+    interleave: false
+
+  4:
+    name: "L'+D 320x240@10"
+    color: {w: 320, h: 240, fmt: 1, split_lr: false}
+    depth: {w: 320, h: 240, dtype: 2}
+    zd_index: 3
+    fps: 10
+    interleave: false
+
+  5:
+    name: "L'+R'+D 640(x2)x480@25 + 640x480 depth"
+    color: {w: 1280, h: 480, fmt: 1, split_lr: true}
+    depth: {w:  640, h: 480, dtype: 2}
+    zd_index: 2
+    fps: 25
+    interleave: false
+
+  6:
+    name: "L'+R'+D 320(x2)x240@30 + 320x240 depth"
+    color: {w: 640, h: 240, fmt: 1, split_lr: true}
+    depth: {w: 320, h: 240, dtype: 2}
+    zd_index: 3
+    fps: 30
+    interleave: false
+
+  7:
+    name: "L'+R'+D 640(x2)x480@10 + 640x480 depth"
+    color: {w: 1280, h: 480, fmt: 0, split_lr: true}
+    depth: {w:  640, h: 480, dtype: 2}
+    zd_index: 2
+    fps: 10
+    interleave: false
+
+  8:
+    name: "L'+R'+D 320(x2)x240@10 + 320x240 depth"
+    color: {w: 640, h: 240, fmt: 0, split_lr: true}
+    depth: {w: 320, h: 240, dtype: 2}
+    zd_index: 3
+    fps: 10
+    interleave: false
+
+  9:
+    name: "D-only 640x480@10"
+    color: {w: 0, h: 0, fmt: 1, split_lr: false}
+    depth: {w: 640, h: 480, dtype: 2}
+    zd_index: 2
+    fps: 10
+    interleave: false
+
+  # Mode 10 uses dtype 2 (D path). On current G62 firmware the D path
+  # is capped at ~10 fps for the 640x480 raster; the dtype-11 D11 path
+  # (mode 11) reaches the full 25 fps and is preferred unless a downstream
+  # consumer specifically requires the D format. Enabling spatial or
+  # temporal filtering forces the D path. Tracked for the next firmware
+  # revision; verify whether the cap is lifted when that lands.
+  10:
+    name: "D-only 640x480@25"
+    color: {w: 0, h: 0, fmt: 1, split_lr: false}
+    depth: {w: 640, h: 480, dtype: 2}
+    zd_index: 2
+    fps: 25
+    interleave: false
+
+  11:
+    name: "D-only 320x240@10"
+    color: {w: 0, h: 0, fmt: 1, split_lr: false}
+    depth: {w: 320, h: 240, dtype: 2}
+    zd_index: 3
+    fps: 10
+    interleave: false
+
+  12:
+    name: "D-only 320x240@30"
+    color: {w: 0, h: 0, fmt: 1, split_lr: false}
+    depth: {w: 320, h: 240, dtype: 2}
+    zd_index: 3
+    fps: 30
+    interleave: false
+
+  13:
+    name: "L+R 640(x2)x480@10"
+    color: {w: 1280, h: 480, fmt: 0, split_lr: true}
+    depth: {w: 0, h: 0, dtype: 0}
+    zd_index: 2
+    fps: 10
+    interleave: false
+
+  14:
+    name: "L+R 320(x2)x240@10"
+    color: {w: 640, h: 240, fmt: 0, split_lr: true}
+    depth: {w: 0, h: 0, dtype: 0}
+    zd_index: 3
+    fps: 10
+    interleave: false
+
+  15:
+    name: "L+R+D 640(x2)x480@10 + 640x480 depth"
+    color: {w: 1280, h: 480, fmt: 0, split_lr: true}
+    depth: {w:  640, h: 480, dtype: 7}
+    zd_index: 2
+    fps: 10
+    interleave: false

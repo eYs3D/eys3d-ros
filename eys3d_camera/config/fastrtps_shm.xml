@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  FastRTPS profile: enlarged SHM transport for intra-host image streaming.
+
+  Default FastRTPS SHM segment_size in 2.1.x is 512 KB; a single 640x480 rgb8
+  frame is ~900 KB and a wide 1280x720 rgb8 frame is ~2.7 MB, so the default
+  silently falls back to UDP loopback which then loses RTPS fragments under
+  load. 32 MB is comfortable headroom for a few buffered images of any
+  supported mode.
+
+  Usage (every terminal that runs a publisher or a subscriber):
+    export FASTRTPS_DEFAULT_PROFILES_FILE=$(ros2 pkg prefix eys3d_camera)/share/eys3d_camera/config/fastrtps_shm.xml
+    # or copy this file elsewhere and point the env var at that absolute path.
+-->
+<dds>
+  <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>shm_big</transport_id>
+        <type>SHM</type>
+        <segment_size>33554432</segment_size>
+        <port_queue_capacity>512</port_queue_capacity>
+      </transport_descriptor>
+      <transport_descriptor>
+        <transport_id>udp_default</transport_id>
+        <type>UDPv4</type>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="participant_profile" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>shm_big</transport_id>
+          <transport_id>udp_default</transport_id>
+        </userTransports>
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

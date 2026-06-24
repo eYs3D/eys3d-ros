@@ -1,0 +1,33 @@
+# eys3d_camera default filter profile.
+#
+# Loaded by the launch when `filter_profile:=default` (or omitted).
+# All values are runtime-tunable through `ros2 param set`; this file
+# only seeds the initial state at node startup. Enable switches
+# (spatial_filter, temporal_filter, hole_filling, colored_pointcloud) stay on
+# the launch command line and are not redefined here.
+#
+# Resolution path:
+#   filter_profile := <name>
+#     → share/eys3d_camera/cfg/filter_profiles/<name>.yaml
+#
+# To author a custom profile, copy this file and edit individual
+# fields; absent fields fall back to the node's compiled defaults.
+
+/**:
+  ros__parameters:
+    # ── Spatial filter (disparity-domain edge-aware IIR) ─────────
+    # 4-direction recursive IIR applied to Q4 disparity, with
+    # optional integrated hole bridging in each direction pass.
+    spatial_filter_alpha:        0.5     # smoothing strength, 0.0..1.0
+    spatial_filter_delta:        20      # edge threshold, raw disparity units
+    spatial_filter_magnitude:    2       # 4-direction iterations, 1..5
+    spatial_filter_holes_fill:   0       # max consecutive holes bridged per direction; 0 = no bridging
+
+    # ── Temporal filter ──────────────────────────────────────────
+    # Per-pixel alpha blend against the previous frame, with an
+    # 8-frame validity bitmask driving persistence on invalid pixels.
+    # Runs in Q4 disparity when chained after the spatial filter, or
+    # directly on the Z14 mm depth raster otherwise.
+    temporal_filter_alpha:       0.4     # 0.0..1.0
+    temporal_filter_delta:       20      # edge guard; disparity units (Q4 path) or mm (Z14 path)
+    temporal_filter_persistence: 3       # 0..8; 0=disabled, 8=indefinite
