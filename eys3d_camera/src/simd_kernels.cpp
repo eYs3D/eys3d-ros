@@ -269,4 +269,89 @@ uint32_t pc_count_nonzero(const uint16_t* row, int w) {
     return count;
 }
 
+// ---------------------------------------------------------------------------
+//   Monochrome fast path
+// ---------------------------------------------------------------------------
+
+void yuyv_extract_y(const uint8_t* src, uint8_t* gray, int w, int h) {
+    const size_t in_stride = static_cast<size_t>(w) * 2;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int v = 0; v < h; ++v) {
+        const uint8_t* p = src  + static_cast<size_t>(v) * in_stride;
+        uint8_t* q       = gray + static_cast<size_t>(v) * w;
+        int u = 0;
+#if defined(__aarch64__)
+        // vld2q_u8 de-interleaves YUYV: val[0] = Y bytes, val[1] = chroma.
+        for (; u + 16 <= w; u += 16) {
+            const uint8x16x2_t yc = vld2q_u8(p + static_cast<size_t>(u) * 2);
+            vst1q_u8(q + u, yc.val[0]);
+        }
+#endif
+        for (; u < w; ++u) q[u] = p[static_cast<size_t>(u) * 2];
+    }
+}
+
+void gray_to_rgb8(const uint8_t* gray, uint8_t* dst, int w, int h) {
+    const size_t out_stride = static_cast<size_t>(w) * 3;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int v = 0; v < h; ++v) {
+        const uint8_t* g = gray + static_cast<size_t>(v) * w;
+        uint8_t* q       = dst  + static_cast<size_t>(v) * out_stride;
+        int u = 0;
+#if defined(__aarch64__)
+        // vst3q_u8 with all three lanes = gray writes R=G=B for 16 pixels.
+        for (; u + 16 <= w; u += 16) {
+            const uint8x16_t gv = vld1q_u8(g + u);
+            uint8x16x3_t rgb; rgb.val[0] = gv; rgb.val[1] = gv; rgb.val[2] = gv;
+            vst3q_u8(q + static_cast<size_t>(u) * 3, rgb);
+        }
+#endif
+        for (; u < w; ++u) {
+            const uint8_t y = g[u];
+            uint8_t* o = q + static_cast<size_t>(u) * 3;
+            o[0] = y; o[1] = y; o[2] = y;
+        }
+    }
+}
+
+void gray_to_rgb8_split(const uint8_t* gray,
+                        uint8_t* dst_left, uint8_t* dst_right,
+                        int half_w, int h) {
+    const int wide = half_w * 2;
+    const size_t out_stride = static_cast<size_t>(half_w) * 3;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int v = 0; v < h; ++v) {
+        const uint8_t* gl = gray + static_cast<size_t>(v) * wide;
+        const uint8_t* gr = gl + half_w;
+        uint8_t* ql = dst_left  + static_cast<size_t>(v) * out_stride;
+        uint8_t* qr = dst_right + static_cast<size_t>(v) * out_stride;
+        int u = 0;
+#if defined(__aarch64__)
+        // vst3q_u8 with all three lanes = gray writes R=G=B for 16 pixels,
+        // applied to the left and right halves independently.
+        for (; u + 16 <= half_w; u += 16) {
+            const uint8x16_t lv = vld1q_u8(gl + u);
+            const uint8x16_t rv = vld1q_u8(gr + u);
+            uint8x16x3_t lrgb; lrgb.val[0] = lv; lrgb.val[1] = lv; lrgb.val[2] = lv;
+            uint8x16x3_t rrgb; rrgb.val[0] = rv; rrgb.val[1] = rv; rrgb.val[2] = rv;
+            vst3q_u8(ql + static_cast<size_t>(u) * 3, lrgb);
+            vst3q_u8(qr + static_cast<size_t>(u) * 3, rrgb);
+        }
+#endif
+        for (; u < half_w; ++u) {
+            const uint8_t yl = gl[u], yr = gr[u];
+            uint8_t* ol = ql + static_cast<size_t>(u) * 3;
+            uint8_t* orr = qr + static_cast<size_t>(u) * 3;
+            ol[0] = yl; ol[1] = yl; ol[2] = yl;
+            orr[0] = yr; orr[1] = yr; orr[2] = yr;
+        }
+    }
+}
+
 }  // namespace eys3d_camera::simd

@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>eys3d_camera</name>
-  <version>1.0.0</version>
+  <version>2.0.0</version>
   <description>
     ROS 2 driver for eYs3D stereo depth cameras (G100+, R77, G62).
     Built directly on the eSPDI C API for low-latency color, depth, and
@@ -21,7 +21,9 @@
   <depend>diagnostic_updater</depend>
   <depend>geometry_msgs</depend>
   <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
   <depend>rclcpp_components</depend>
+  <depend>eys3d_camera_interfaces</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
@@ -31,6 +33,11 @@
   <depend>yaml-cpp</depend>
 
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>xacro</exec_depend>
+
+  <test_depend>ament_cmake_pytest</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

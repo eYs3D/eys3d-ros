@@ -1,12 +1,12 @@
-# G62 video-mode catalogue.
-# Source: YMS025_G62 Datasheet Rev 0.6 (2025-02-26), Table 4.1.
+# G62 video-mode catalog.
+# Source: eYs3D G62 product datasheet.
 #
 # Usage:
 #   ros2 launch eys3d_camera G62.launch.py mode_id:=<id>
 #
 # Camera:
 #   USB 2.0 monochrome depth module, 640x480 mono sensor pair. Depth is
-#   14-bit distance in millimetres.
+#   14-bit distance in millimeters.
 #
 # Mode schema (every field is required on every entry):
 #   color.w / color.h     pixel resolution (0/0 = color stream off)
@@ -18,12 +18,29 @@
 #   fps                   physical frame rate
 #   interleave            true = SDK splits color/depth from a unified stream
 #                         (effective per-stream rate is fps / 2)
+#   usb                   USB port type the mode needs (2 = USB2.0, 3 = USB3.0)
+#
+# Model header (every field is required):
+#   pid                   USB product ID; open() refuses a mismatched device
+#   mono                  true = monochrome sensor pair (color stream is luma)
+#   ir                    projector level range and the default applied when
+#                         the ir_value parameter is -1
+#   depth_range_mm        PointCloud working-range defaults; the depth_near_mm /
+#                         depth_far_mm launch parameters (> 0) override
+#   signature_mode        USB port type -> default mode_id opened when mode_id
+#                         is -1 (auto) for the negotiated link
 
 model: G62
+pid: 0x0183
+mono: true
+ir: {min: 0, max: 96, default: 60}
+depth_range_mm: {near: 100, far: 1500}
+signature_mode: {2: 1}   # USB port type -> default mode
 
 modes:
   1:
     name: "L'+D 640x480@25"
+    usb: 2
     color: {w: 640, h: 480, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 2
@@ -32,6 +49,7 @@ modes:
 
   2:
     name: "L'+D 640x480@10"
+    usb: 2
     color: {w: 640, h: 480, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 2
@@ -40,6 +58,7 @@ modes:
 
   3:
     name: "L'+D 320x240@30"
+    usb: 2
     color: {w: 320, h: 240, fmt: 1, split_lr: false}
     depth: {w: 320, h: 240, dtype: 2}
     zd_index: 3
@@ -48,6 +67,7 @@ modes:
 
   4:
     name: "L'+D 320x240@10"
+    usb: 2
     color: {w: 320, h: 240, fmt: 1, split_lr: false}
     depth: {w: 320, h: 240, dtype: 2}
     zd_index: 3
@@ -56,6 +76,7 @@ modes:
 
   5:
     name: "L'+R'+D 640(x2)x480@25 + 640x480 depth"
+    usb: 2
     color: {w: 1280, h: 480, fmt: 1, split_lr: true}
     depth: {w:  640, h: 480, dtype: 2}
     zd_index: 2
@@ -64,6 +85,7 @@ modes:
 
   6:
     name: "L'+R'+D 320(x2)x240@30 + 320x240 depth"
+    usb: 2
     color: {w: 640, h: 240, fmt: 1, split_lr: true}
     depth: {w: 320, h: 240, dtype: 2}
     zd_index: 3
@@ -72,6 +94,7 @@ modes:
 
   7:
     name: "L'+R'+D 640(x2)x480@10 + 640x480 depth"
+    usb: 2
     color: {w: 1280, h: 480, fmt: 0, split_lr: true}
     depth: {w:  640, h: 480, dtype: 2}
     zd_index: 2
@@ -80,6 +103,7 @@ modes:
 
   8:
     name: "L'+R'+D 320(x2)x240@10 + 320x240 depth"
+    usb: 2
     color: {w: 640, h: 240, fmt: 0, split_lr: true}
     depth: {w: 320, h: 240, dtype: 2}
     zd_index: 3
@@ -88,6 +112,7 @@ modes:
 
   9:
     name: "D-only 640x480@10"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 2
@@ -98,10 +123,10 @@ modes:
   # is capped at ~10 fps for the 640x480 raster; the dtype-11 D11 path
   # (mode 11) reaches the full 25 fps and is preferred unless a downstream
   # consumer specifically requires the D format. Enabling spatial or
-  # temporal filtering forces the D path. Tracked for the next firmware
-  # revision; verify whether the cap is lifted when that lands.
+  # temporal filtering forces the D path.
   10:
     name: "D-only 640x480@25"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 2
@@ -110,6 +135,7 @@ modes:
 
   11:
     name: "D-only 320x240@10"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 320, h: 240, dtype: 2}
     zd_index: 3
@@ -118,6 +144,7 @@ modes:
 
   12:
     name: "D-only 320x240@30"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 320, h: 240, dtype: 2}
     zd_index: 3
@@ -126,6 +153,7 @@ modes:
 
   13:
     name: "L+R 640(x2)x480@10"
+    usb: 2
     color: {w: 1280, h: 480, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 0}
     zd_index: 2
@@ -134,6 +162,7 @@ modes:
 
   14:
     name: "L+R 320(x2)x240@10"
+    usb: 2
     color: {w: 640, h: 240, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 0}
     zd_index: 3
@@ -142,6 +171,7 @@ modes:
 
   15:
     name: "L+R+D 640(x2)x480@10 + 640x480 depth"
+    usb: 2
     color: {w: 1280, h: 480, fmt: 0, split_lr: true}
     depth: {w:  640, h: 480, dtype: 7}
     zd_index: 2

@@ -22,20 +22,40 @@
 ## インストール
 
 ```bash
-sudo apt install ros-$ROS_DISTRO-diagnostic-updater
+sudo apt install ros-$ROS_DISTRO-diagnostic-updater \
+                 ros-$ROS_DISTRO-robot-state-publisher ros-$ROS_DISTRO-xacro \
+                 ros-$ROS_DISTRO-rviz2
 ```
 
-本パッケージを workspace の `src/` に置きビルド:
+機種別 launch は `urdf:=true` と `rviz:=true` がデフォルトのため、
+`robot_state_publisher`、`xacro`、`rviz2` が無いと起動しません。
+`urdf:=false rviz:=false` を渡せば不要です。
+
+`eys3d_camera` と `eys3d_camera_interfaces`（セルフキャリブレーションの
+action 定義）の 2 つのパッケージを workspace の `src/` に置きビルドします。
+`--packages-up-to` により interfaces が先にビルドされます:
 
 ```bash
 cd ~/ros2_ws
-colcon build --packages-select eys3d_camera --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon build --packages-up-to eys3d_camera --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
 
-per-model launch はデフォルトで RViz を起動します。
-`sudo apt install ros-$ROS_DISTRO-rviz2` で一度導入するか、
-`rviz:=false` を付与して視覚化をスキップしてください。
+
+### デバイスの権限
+
+ドライバは一般ユーザーとしてカメラを開きます。デバイスのオープンが
+権限エラーで失敗する場合は、eSPDI SDK が USB デバイスにアクセスできる
+よう、同梱の udev ルールをインストールしてください:
+
+```bash
+sudo cp install/eys3d_camera/share/eys3d_camera/udev/99-eys3d.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+その後カメラを挿し直します。このルールは eYs3D デバイス（USB vendor
+`3438`）へのアクセスを許可します。あるいは、ユーザーを `video` グループ
+に追加して再ログインしても構いません。
 
 ---
 
@@ -58,12 +78,31 @@ mode の切替は `mode_id:=<n>` で指定します。各モデルの全 mode �
 
 | Topic | 型 | 説明 |
 |---|---|---|
-| `/G100P_1/left_color` | `sensor_msgs/Image` | 左眼カラー画像。常に `rgb8`（YUYV と MJPEG ソースをインラインで RGB888 にデコード；モノクロセンサ機種は R=G=B として出力）。補正の有無は現在の video mode で決まります。|
-| `/G100P_1/right_color` | `sensor_msgs/Image` | 右眼カラー画像；video mode が L\|R をワンエンドポイントに格納する場合のみ配信（`split_lr: true`）|
-| `/G100P_1/depth_image` | `sensor_msgs/Image` (`16UC1`, mm, REP-118) | 深度(ミリメートル) |
-| `/G100P_1/pointcloud` | `sensor_msgs/PointCloud2` | XYZ float32、ROS 基底軸(メートル);`colored_pointcloud:=true` のとき XYZRGB |
+| `/G100P_1/left_color/image_raw` | `sensor_msgs/Image` | 左眼カラー画像。常に `rgb8`（YUYV と MJPEG ソースをインラインで RGB888 にデコード；モノクロセンサ機種は R=G=B として出力）。補正の有無は現在の video mode で決まります。|
+| `/G100P_1/right_color/image_raw` | `sensor_msgs/Image` | 右眼カラー画像；video mode が L\|R をワンエンドポイントに格納する場合のみ配信（`split_lr: true`）|
+| `/G100P_1/depth/image_raw` | `sensor_msgs/Image` (`16UC1`, mm, REP-118) | 深度(ミリメートル) |
+| `/G100P_1/depth/points` | `sensor_msgs/PointCloud2` | XYZ float32、ROS 基底軸(メートル);`colored_pointcloud:=true` のとき XYZRGB |
 | `/G100P_1/<stream>/camera_info` | `sensor_msgs/CameraInfo` | 内部パラメータ、Image フレームごと(`header.stamp` 一致) |
 | `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | ヘルスメトリクス、1 Hz |
+
+### CameraInfo と歪み係数
+
+各 `camera_info` は、その topic で配信される画像そのものを記述します。
+
+深度はすべてのモードで補正済みです。カラーはカタログ名にアポストロフィが
+付くモード(`L'+D`、`L'+R'+D`)で補正済みです。それらの topic では `k` は
+`p` の左 3×3、`d` はゼロ(`plumb_bob`)、`r` は単位行列になります。カメラが
+すでに歪みを取り除いているため、戻すものが残っていません。
+
+`L+R` と `L+R+D` モードはカラー topic に生のセンサー画像を配信します。
+そこでの `k` と `d` は配信解像度における工場出荷時のレンズモデル、`r` は
+補正回転で、`image_proc` がそのまま補正できます。係数の個数を仮定せず
+`distortion_model` を読んでください。ドライバは `rational_polynomial` 8 個
+または `plumb_bob` 5 個を、その個体に保存された校正値に従って報告します。
+
+いずれの場合も `p` が投影行列であり、姿勢推定(AprilTag、PnP、SLAM)で
+使うべき内部パラメータです。ステレオ対では右カメラの `p[3]` が
+`-fx × ベースライン`(メートル)です。
 
 ### サブスクライバの QoS
 
@@ -90,9 +129,9 @@ self.create_subscription(Image, topic, callback, qos_profile=qos_profile_sensor_
 「IR ドットが映り込まない color」と「高品質の depth」を同時に
 取得するため、eYs3D は Interleave モードを採用しています:
 
-- **偶数 frame —— IR オフ → `/left_color`**。
+- **偶数 frame —— IR オフ → `/left_color/image_raw`**。
   IR ドットの映り込みがなく、クリーンな RGB 画像を出力します。
-- **奇数 frame —— IR オン → `/depth_image`**。
+- **奇数 frame —— IR オン → `/depth/image_raw`**。
   IR ドットがステレオマッチングに構造的特徴を与え、より高品質
   な深度が得られます。
 
@@ -101,11 +140,11 @@ self.create_subscription(Image, topic, callback, qos_profile=qos_profile_sensor_
 
 #### タイムスタンプへの影響
 
-G100+ デフォルトの `mode_id=1` を例にすると:
+USB 3.0 での G100+ デフォルト `mode_id=1` を例にすると:
 
 ```
-sensor 60 fps  ──SDK interleave──>  /G100P_1/left_color   30 fps
-                                 └  /G100P_1/depth_image  30 fps
+sensor 60 fps  ──SDK interleave──>  /G100P_1/left_color/image_raw  30 fps
+                                 └  /G100P_1/depth/image_raw       30 fps
 ```
 
 color と depth は **隣接する 2 枚の sensor frame** から得られ、
@@ -119,7 +158,7 @@ color と depth の対応付けには `message_filters::ApproximateTime`
 
 #### 該当する mode ID
 
-`launch/video_modes/G100P.yaml` において、**`mode_id` 1, 3, 5, 7–21**
+`launch/video_modes/G100P.yaml` において、**`mode_id` 1, 3, 5, 7–21, 56, 57**
 が interleave です。それ以外のモードは color と depth を同時取得し、
 stamp が一致します。
 
@@ -145,26 +184,28 @@ per-model launch のデフォルト `log:=sdk` ではこの層が抑制されま
 | パラメータ | デフォルト | 説明 |
 |---|---|---|
 | `camera_name` | `<MODEL>_1` | ROS namespace と frame-id の前置詞 |
-| `mode_id` | `1` | video mode 一覧内のインデックス |
+| `mode_id` | `-1` | video mode 一覧内のインデックス;`-1` = 自動(ネゴシエートされた USB 速度に対する signature デフォルト) |
 | `dev_serial_number` | `""` | シリアル番号の部分一致でバインド |
 | `usb_port` | `""` | USB トポロジ（例 `2-3:1.0`）でバインド |
-| `depth_minimum_mm` | `-1` | `/depth_image` と `/pointcloud` 双方に適用される近接カットオフ。これ未満のピクセルは 0 にクリップ。`-1` = モデル既定（G100+ 250、R77 200、G62 100）|
-| `depth_maximum_mm` | `-1` | `/depth_image` と `/pointcloud` 双方に適用される遠方カットオフ。これ超過のピクセルは 0 にクリップ。`-1` = モデル既定（G100+ 1900、R77/G62 1500）|
+| `depth_near_mm` | `-1` | `/depth/image_raw` と `/depth/points` 双方に適用される近接カットオフ。これ未満のピクセルは 0 にクリップ。`-1` = モデル既定（G100+ 250、R77 200、G62 100）|
+| `depth_far_mm` | `-1` | `/depth/image_raw` と `/depth/points` 双方に適用される遠方カットオフ。これ超過のピクセルは 0 にクリップ。`-1` = モデル既定（G100+ 1900、R77/G62 1500）|
 | `colored_pointcloud` | `false` | 直近の左カラーフレームを参照して XYZRGB PointCloud2 を出力。Depth-only モードでは自動で XYZ にフォールバック |
 | `spatial_filter` | `false` | 視差ドメインの edge-aware IIR 空間フィルタを有効化（bool 切替）|
 | `temporal_filter` | `false` | 時間フィルタ、alpha ブレンド + persistence を有効化（bool 切替、実行中に調整可能）|
 | `hole_filling` | `0` | Z ドメインの hole fill モード。`0` = OFF、`1` = fill_from_left、`2` = farthest_from_around、`3` = nearest_from_around（整数モード、bool ではない）|
 | `filter_profile` | `default` | チューニングプロファイル名。`cfg/filter_profiles/<name>.yaml` に解決され、起動時にフィルタのチューニング値を読み込む |
-| `ir_intensity` | `-1` | `-1` = モデル既定（G100+ / R77 = 3、G62 = 60）；`0` = OFF；正整数で FW 範囲（G100+ 0-9、R77 0-6、G62 0-96）に上書き |
+| `ir_value` | `-1` | `-1` = モード依存の既定値：深度ありのモードまたはモノクロ機（G62 / R77）ではモデル既定（G100+ / R77 = 3、G62 = 60）、カラーセンサーのカラー専用モードでは OFF；`0` = OFF；正整数で FW 範囲（G100+ 0-6、R77 0-6、G62 0-96）に上書き |
 | `log` | `sdk`（per-model）/ `all`（generic） | 端末出力レベル。`all` = RCLCPP + SDK の全出力；`sdk` = RCLCPP INFO/DEBUG を抑制し WARN/ERROR + SDK printf は維持；`close` = すべてを per-process ログファイルへリダイレクト（端末は無音）|
+| `urdf` | `true` | namespace 分離した `robot_state_publisher` で `<camera_name>/robot_description` にカメラモデル(mesh + 取付穴 frame)を配信。ロボット側の記述に既にカメラが含まれる場合は `false` |
 | `rviz` | `true` | RViz を自動起動 |
+| `selfcal_enable` | `false` | オプションのセルフキャリブレーションを有効化。`true` で `selfcal/run` アクションと `selfcal/commit` サービスが利用可能になる（「セルフキャリブレーション」節を参照）。launch 時のみ |
 
 カラーが `left_color` と `right_color` に分割されるかは、選択した video mode（`launch/video_modes/<MODEL>.yaml` の `split_lr` フラグ）で決まり、launch 引数では制御しません。
 
 ### 画像コントロール
 
-eYs3D の各モジュールは工場出荷時に `enable_auto_exposure` ON、
-`enable_auto_white_balance` ON、`power_line_frequency` 60 Hz に
+eYs3D の各モジュールは工場出荷時に `auto_exposure` ON、
+`auto_white_balance` ON、`power_line_frequency` 60 Hz に
 設定されています。ドライバはファームウェアの起動値をそのまま継承
 し、**オペレータが明示的に上書きしたときだけカメラに書き戻します**。
 そのため ROS 以外で調整した設定は再起動後も保持されます。IR だけは
@@ -173,12 +214,14 @@ eYs3D の各モジュールは工場出荷時に `enable_auto_exposure` ON、
 実行中の動的調整(再起動不要):
 
 ```bash
-ros2 param set /G100P_1/eys3d_camera ir_intensity         5
-ros2 param set /G100P_1/eys3d_camera enable_auto_exposure      false   # マニュアル露光
-ros2 param set /G100P_1/eys3d_camera exposure_time_step        -8
-ros2 param set /G100P_1/eys3d_camera enable_auto_white_balance false
+ros2 param set /G100P_1/eys3d_camera ir_value             5
+ros2 param set /G100P_1/eys3d_camera auto_exposure        false   # マニュアル露光
+ros2 param set /G100P_1/eys3d_camera exposure_time_step   -8
+ros2 param set /G100P_1/eys3d_camera auto_white_balance   false
 ros2 param set /G100P_1/eys3d_camera power_line_frequency 1       # 1 = 50 Hz、2 = 60 Hz
 ```
+
+`exposure_time_step` は **[-13, 3]** の符号付き整数（log2 露光レジスタ）を取り、`auto_exposure` が `false` のときにのみ適用されます。
 
 ### 後処理フィルタ
 
@@ -221,9 +264,10 @@ ros2 param set /G100P_1/eys3d_camera temporal_filter_persistence 3
 
 ### 実行時ストリーム制御
 
-カメラ出力を一時停止または停止する 2 つのサービスがあります
-(ROS node はそのまま走り続けます)。どちらも color と depth を
-まとめて制御します。
+カメラ出力を制御する 3 つのサービスがあります(ROS node はそのまま
+走り続けます)。`pause` と `standby` は `std_srvs/srv/SetBool` を受け取り
+color と depth をまとめて制御します。`hw_reset` は `std_srvs/srv/Empty`
+を受け取り、USB 経由でカメラをハードウェアリセットします。
 
 ```bash
 # フレームの publish は停止しますが、カメラは USB 上で stream を
@@ -233,10 +277,16 @@ ros2 service call /G100P_1/pause   std_srvs/srv/SetBool "{data: true}"
 ros2 service call /G100P_1/pause   std_srvs/srv/SetBool "{data: false}"
 
 # USB パイプを完全に解放します。ROS node は生きたまま、topic も
-# advertised のまま。resume は約 300 ms でカメラを再オープンします。
+# advertised のまま。resume はカメラを再オープンし、機種により数秒かかります。
 # USB 帯域を他のデバイスに譲りたいときに使います。
 ros2 service call /G100P_1/standby std_srvs/srv/SetBool "{data: true}"
 ros2 service call /G100P_1/standby std_srvs/srv/SetBool "{data: false}"
+
+# USB 経由でカメラをリセット(デバイスを再列挙)します。node は
+# ストリームを停止してリセットを発行し、その後 watchdog が自動で
+# 再接続します。フレームは通常約 12 秒で復帰します。node を再起動
+# せずに固まったカメラを復旧するために使います。
+ros2 service call /G100P_1/hw_reset std_srvs/srv/Empty
 ```
 
 Standby 中は、自動再接続 watchdog (次節) は無信号を意図的なものと
@@ -245,19 +295,18 @@ Standby 中は、自動再接続 watchdog (次節) は無信号を意図的な�
 
 ### ホットプラグ自動復旧
 
-ドライバは 1 Hz の watchdog を内蔵しています。color **と** depth の
-両方が **3 秒間連続**でフレームを受信しない場合(起動直後は 10 秒に
-緩和)、watchdog はデバイスを close し再接続ループに入り、2 秒ごとに
-再オープンを試みます。カメラが再接続されると元の topic は自動的に
-再開され、**`ros2 launch` の再起動は不要**です。
+ドライバは 1 Hz の watchdog を内蔵し、ストリームごとに個別に監視します。
+あるストリームが一度フレームを出したあと **3 秒間連続**で無音になると、
+デバイスを close して再接続ループに入り、2 秒ごとに再オープンを試みます。
+color が流れ続けたまま depth がファームウェア側で停止した場合も復旧します。
+最初のフレームが届くまでのしきい値は 10 秒で、R77 の 7 fps のような低速
+モードをカバーします。カメラが再接続されると元の topic は自動的に再開され、
+**`ros2 launch` の再起動は不要**です。
 
 ```
-[ERROR] watchdog: no frames for 3 s — declaring camera disconnected
+[ERROR] watchdog: depth stream silent for 3 s; declaring camera disconnected
 [INFO]  watchdog: reconnect succeeded after 2 attempt(s)
 ```
-
-低速モード(例:R77 の 7 fps)は 10 秒の起動猶予で吸収されます。
-最初の 1 フレームを観測した時点で、3 秒の定常判定しきい値に切り替わります。
 
 ### マルチカメラ
 
@@ -285,9 +334,9 @@ ros2 launch eys3d_camera G100P.launch.py \
 配線に合わせて書き換えてから起動してください:
 
 ```bash
-ros2 launch eys3d_camera examples/dual_G62.launch.py
-ros2 launch eys3d_camera examples/dual_G100P.launch.py
-ros2 launch eys3d_camera examples/G100P_plus_R77.launch.py
+ros2 launch eys3d_camera dual_G62.launch.py
+ros2 launch eys3d_camera dual_G100P.launch.py
+ros2 launch eys3d_camera G100P_plus_R77.launch.py
 ```
 
 同梱のマルチカメラサンプルは、USB 帯域の範囲内で 2 台が安定して
@@ -309,18 +358,35 @@ ros2 launch eys3d_camera examples/G100P_plus_R77.launch.py
 PointCloud2 は `<camera_name>_points_frame` を使用し、すでに ROS
 基底軸に変換済みです(追加の回転は不要)。
 
-ロボット URDF に統合する場合は、既存 frame の下に `<camera_name>_link`
-をマウントしてください。最小例(`parent_link`、joint 名、取付姿勢は
-プラットフォームに合わせて調整してください):
+各モデルには 3D mesh 付きの URDF/xacro 記述ファイルが付属します
+(`urdf/eys3d_<MODEL>.urdf.xacro` + `meshes/<MODEL>.dae`)。`<name>_link`
+は深度起点に位置します —— 左右イメージャの中央、光軸の高さ、カメラ
+前面から Z' だけ内側(G100+ 6.75 mm、R77 4.8 mm、G62 3.1 mm)。ロボットの
+既存 frame の下に、実際の取付姿勢で macro をインスタンス化してください:
 
 ```xml
-<joint name="g100p_mount" type="fixed">
-  <parent link="parent_link"/>
-  <child  link="G100P_1_link"/>
+<xacro:include filename="$(find eys3d_camera)/urdf/eys3d_G100P.urdf.xacro"/>
+<xacro:eys3d_G100P name="G100P_1" parent="parent_link">
   <origin xyz="0.10 0.00 0.05" rpy="0 0 0"/>
-</joint>
-<link name="G100P_1_link"/>
+</xacro:eys3d_G100P>
 ```
+
+単体プレビュー(`name` の既定値は `<MODEL>_1` で、ドライバおよび付属の
+rviz レイアウトと一致します):
+
+```bash
+ros2 launch eys3d_camera display_model.launch.py model:=G100P
+```
+
+3 モデルを並べてプレビュー（ハードウェア不要）:
+
+```bash
+ros2 launch eys3d_camera three_models.launch.py
+```
+
+各記述ファイルには筐体の取付穴 frame(`<name>_tripod_frame` および
+`<name>_back/bottom_screw*_frame`、位置は工場 CAD 由来)も含まれ、
+メカ設計との整合確認に使えます。
 
 ドライバはカメラ TF ツリーを `TRANSIENT_LOCAL` durability で
 `/tf_static` に 1 回配信します。後から購読を始めたノードも
@@ -337,7 +403,7 @@ PointCloud2 は `<camera_name>_points_frame` を使用し、すでに ROS
 引き渡され、DDS を介しません。
 
 ```bash
-ros2 launch eys3d_camera examples/G100P_composable.launch.py \
+ros2 launch eys3d_camera G100P_composable.launch.py \
     use_intra_process_comms:=true
 ```
 
@@ -362,9 +428,10 @@ ros2 launch eys3d_camera examples/G100P_composable.launch.py \
 
 | `level` | `message` | 意味 |
 |---|---|---|
-| `OK` | `streaming OK` | 各有効ストリームが期待 fps の 50 % 以上 |
-| `WARN` | `one stream below 50% of expected fps` | 片方のストリームが遅い |
-| `ERROR` | `no frames flowing on enabled streams` | 有効ストリームが全て閾値未満(または完全に無音) |
+| `OK` | `streaming` | 設定された各ストリームが配信中 |
+| `OK` | `streaming (paused — publish gated by operator)` | `pause` が有効 |
+| `OK` | `standby (USB pipe closed by operator)` | `standby` が有効 |
+| `ERROR` | `no frames flowing on any configured stream` | 設定された全ストリームが期待レートの半分未満 |
 | `ERROR` | `camera disconnected; Linux device node not present` | USB 切断、ウォッチドッグがデバイス復帰時に自動再接続 |
 
 タスクごとの `values` キーバリュー:
@@ -393,11 +460,14 @@ ros2 launch eys3d_camera examples/G100P_composable.launch.py \
 | `decode_avg_ms` | (`color` のみ)直近 1 秒の color デコード平均時間。直近 1 秒内にデコードが発生した場合のみ出力 |
 | `decode_max_ms` | (`color` のみ)これまで観測した最長 color デコード時間。一度でもデコードが発生した場合のみ出力 |
 
+サマリは `streaming`、`input rate below 50% of expected`(WARN)、
+`not configured (D-only mode)`、`standby` のいずれかです。
+
 **`pointcloud`** — 投影 + 後処理カウンタ:
 
 | Key | 説明 |
 |---|---|
-| `compute_status` | `active`(購読者あり)、`idle (no /pointcloud subscriber)`、`idle (never run ; no subscriber since start)`、`(disconnected — see device task)` |
+| `compute_status` | `active`(購読者あり)、`idle (no /depth/points subscriber)`、`idle (never run ; no subscriber since start)`、`(disconnected — see device task)` |
 | `publish_fps` | 直近 1 秒の点群発行数。購読者なしで 0 |
 | `compute_avg_ms` | 直近 1 秒の点群計算平均時間(`active` のとき出力) |
 | `compute_max_ms` | これまで観測した最長点群計算時間 |
@@ -408,7 +478,7 @@ ros2 launch eys3d_camera examples/G100P_composable.launch.py \
 
 | Key | 説明 |
 |---|---|
-| `temperature_c` | チップ温度(°C)。非対応モデルは `n/a (not supported on this model)` |
+| `temperature_c` | チップ温度(°C)。センサーを備えたモデルで読み取りに成功した場合のみ発行され、それ以外はキー自体が現れず、理由はタスクの summary に入る |
 
 `/diagnostics` メッセージは少なくとも 1 つの購読者が接続している
 ときにのみ組み立てて発行されます。ホットパスの atomic カウンタは常
@@ -437,6 +507,137 @@ ros2 run eys3d_camera perf_monitor --ns /G100P_1 --interval 0.5
 
 ---
 
+## セルフキャリブレーション
+
+オプションのストリーム内セルフキャリブレーションは、ステレオペアを再整合し、
+キャリブレーションがずれたモジュールで深度の充填率を回復します。既定で
+ビルドに含まれ(CMake `EYS3D_WITH_SELFCAL`)、launch 時に
+`selfcal_enable:=true` で有効化します。
+
+```bash
+ros2 launch eys3d_camera G100P.launch.py selfcal_enable:=true
+```
+
+実行時はカメラが**深度モードをストリーミングしており、作動距離にある通常の
+テクスチャのあるシーンに向いている**必要があります —— キャリブレーターは
+深度カバレッジを測るため、有効な深度が必要です。1 回の `selfcal/run` アクション
+がセッション全体を実行し、内蔵のチューニングが自動的に適用されます。
+
+```bash
+# 1 回のセッションを実行(収束までブロック、約 20-30 秒、続けて短い再チェック。
+# --feedback は phase / progress をストリーミング)。auto_commit_shift_px < 0 は
+# 結果を有効なまま保持するが flash には決して書き込まない。>= 0 は cy シフトが
+# その画素数に達すると、検証済みで改善された実行を自動書き込みする(下表を参照)。
+ros2 action send_goal /G100P_1/selfcal/run \
+  eys3d_camera_interfaces/action/SelfCal \
+  "{auto_commit_shift_px: 0.25}" --feedback
+
+# 保持した結果を flash に書き込む(自動書き込みが発火しなかった場合のみ必要)。
+# レスポンスの `success` フィールドを確認 —— 保持結果がなければ false になります。
+ros2 service call /G100P_1/selfcal/commit std_srvs/srv/Trigger
+```
+
+探索が終わると、今回はキャリブレーターの outcome **に加えてライブ A/B
+再チェック**で自ら決着します —— 再チェックは同一シーンで「新しい整合 vs 実行前の
+整合」の深度充填率を測るため、判定はシーン依存の推測ではなく実際の前後を
+反映します:
+
+- **改善を検証** —— 再チェックが確認した `SUCCESS` が有効(`applied: true`)。
+  `auto_commit_shift_px` が設定され `cy_shift_px` が到達すれば、今回は flash に
+  **書き込み**(`committed: true`)。そうでなければ**有効なまま保持**されますが
+  揮発性です —— 電源再投入後も残すには `selfcal/commit` を呼び出します。
+- **既に最適**(`NO_CHANGE`)—— 変更・保持・書き込みは行われません。正常で
+  健全な結果です。
+- **悪化 / 検証不能 / 失敗** —— 再チェックが悪化と判定または確認できない場合
+  (例:実行中にカメラが動いた)、あるいは `INSUFFICIENT_INPUT` / `TIMEOUT` /
+  `FAILED` —— カメラは実行前の整合に**ロールバック**されます(`reverted: true`)。
+
+`cy_shift_px` は実測の垂直整合シフトで、ハードウェアから直接読み取られ、自動
+書き込みのゲートが使う値です。刻みは **0.25 px** に固定され、補正は
+**5.0 px** で上限されます。そのため常に `0.25, 0.50, … 5.00` のいずれか
+(動かなければ `0`)です。
+`auto_commit_shift_px` はしきい値で、任意の値を取れますが、動作が変わるのは
+これらの刻み境界だけで、刻みの中間値は次の刻みへ切り上げられます(`0.3` は
+`0.5` と同じ）:
+
+| `auto_commit_shift_px` | 効果 |
+| --- | --- |
+| `-1`(既定)| 自動書き込みしない —— 確認後に手動で書き込む。ゴールでこのフィールドを省略した場合に使われる値 |
+| `0.25` | 実移動(1 ステップ以上)があれば書き込む —— **推奨** |
+| `0.50`, `0.75`, … `5.00` まで | より大きなシフトを要求 |
+| `> 5.0` | 発火しない(シフトは上限を超えられない） |
+
+### アクションの Feedback
+
+ゴールを `--feedback` 付きで送った場合、実行中は継続的に
+ストリーミングされます:
+
+| フィールド | 意味 |
+| --- | --- |
+| `phase` | `INITIAL_SEARCH` / `REFINEMENT` / `RECHECK` / `COMPLETED` |
+| `progress` | 探索の進捗、`0.0`–`1.0` |
+| `processed_frames` | これまでにキャリブレーターへ渡した深度フレーム数 |
+| `valid_ratio_latest` | 最新フレームの充填率(結果が出てから値が入る）|
+
+### アクションの Result
+
+セッションを開始できなかった場合、結論に至らなかった場合、棄却した変更を
+戻せなかった場合は goal が abort します。意図した revert は succeed です。
+いずれの場合も詳細は `outcome` が持ちます。
+
+実行が決着したときに一度だけ返されます —— そのセッションが何を計測し、
+カメラに何を残したかの記録です:
+
+| フィールド | 意味 |
+| --- | --- |
+| `outcome` | `SUCCESS` / `NO_CHANGE` / `INSUFFICIENT_INPUT`(シーンの有効深度が不足)/ `TIMEOUT`(時間内に収束しなかった)/ `FAILED` |
+| `cy_shift_px` | 実測の垂直 cy シフト(px）—— 自動書き込みのしきい値の基準 |
+| `recheck_verdict` | A/B 再チェック:`improved` / `worse` / `inconclusive` / `skipped` |
+| `recheck_ratio_before` / `recheck_ratio_after` | 再チェック時の「実行前 / 収束後」整合の充填率 |
+| `applied` | 補正がレジスタで有効 |
+| `reverted` | 実行前のキャリブレーションへロールバック済み |
+| `committed` | ユーザーキャリブレーション領域に書き込み済み |
+| `message` | 結果の人間可読な要約 |
+| `correction_level`、`valid_ratio_first` / `_latest` / `_delta` | 診断用のみ(書き込みの判定には使わない）|
+
+セッション全体はストリーム内で実行されます:深度は発行され続け、後処理フィルタも
+動作し続けます —— 実行がストリームを再起動することはありません。探索中は
+キャリブレーターが各整合を試すにつれて深度品質が目に見えて変動し、収束後に
+落ち着きます。セッションは**中断できません**(cancel は拒否され、制御セッター
+および `pause` / `standby` / `hw_reset` も拒否します)—— 短時間で、結果が悪ければ
+自動的に復元するため、中断すべきものは何もありません。
+
+`commit` は flash に書き込む唯一のステップです。工場出荷時のキャリブレーション
+はバックアップとして保持され、上書きされることはありません。**保持されたが
+書き込まれていない**結果はカメラのレジスタにのみ存在し、電源再投入または
+`~/hw_reset` で保存済みのキャリブレーションに戻ります。これにより「ライブ
+ストリームでキャリブレーションするが flash には決して書き込まない」運用が
+既定で安全になります —— ロボットがドッキングして静止しているときに実行する
+だけです。
+
+知っておくべき点が 2 つあります:
+
+- **繰り返し実行すると積み重なります。** commit や電源再投入の前に
+  `selfcal/run` をもう一度実行すると、flash からではなく前回の保持結果の
+  続きから始まります。クリーンな基準が欲しい場合は先に `commit` するか
+  電源を再投入してください。
+- **非対応 / 実行中 → rejected であって failed ではありません。** セルフ
+  キャリブレーションに対応していないモジュール、およびセッション実行中に
+  送られた 2 つ目の `selfcal/run` は、どちらも即座に拒否されます ——
+  `ros2 action send_goal` が「Goal was rejected」を報告し(`Result` は
+  ありません)、理由は node log で確認します。
+
+**プロセスごとに 1 セッション。** キャリブレーターはカメラハンドルをプロセス
+グローバルに束縛するため、プロセスを共有するカメラ —— 1 つの
+`ComposableNodeContainer` にある複数のドライバ —— は一度に 1 台ずつしか
+キャリブレーションできません。2 つ目の `selfcal/run` は、最初の実行が決着する
+まで拒否され node log にメッセージが残ります。別プロセスとして起動したカメラは
+影響を受けません。プロセス内通信はこれとは直交します:キャリブレーターは深度
+フレームを自前のコピーとして受け取るため、実行中も `use_intra_process_comms`
+の配信は変わりません。
+
+---
+
 ## トラブルシューティング
 
 | 症状 | 対処 |
@@ -450,20 +651,14 @@ ros2 run eys3d_camera perf_monitor --ns /G100P_1 --interval 0.5
 ### サブスクライバが受信する fps が driver の公開 fps より少ない
 
 `perf_monitor` または `ros2 topic hz` で Rx < Pub と表示される一方で
-`/diagnostics` が `dropped = 0` を示す場合、損失は driver ではなく
+`/diagnostics` が `input_dropped = 0` を示す場合、損失は driver ではなく
 DDS 伝送層で起きています。
 
 サポートされる video mode では、画像 1 フレームのサイズが kernel
 UDP socket と IP fragment reassembly の単発バーストで吸収できる
 容量を超えます(`rgb8` 1280×720 ≈ 2.7 MB、典型的な point cloud は
-最大 ~11 MB)。同じ根本原因(kernel 側バッファのオーバーフロー)が
-2 つの運用環境で異なる症状として現れます:
-
-- **高性能な x86 ホスト**: driver が各フレームを密な UDP fragment
-  burst として送り込み、受信ソケット / reassembly queue が消化し
-  終わる前に溢れます。
-- **リソース制約の強い ARM ホスト**: 同じ kernel buffer の消化が
-  遅く、結果としてバッファが先に満杯になります。
+最大 ~11 MB)。このため kernel 側バッファが溢れます —— x86 ホストが
+速く送りすぎる場合も、ARM ホストが遅く読みすぎる場合も同じです。
 
 本パッケージには FastRTPS を 32 MB の shared-memory segment へ
 切り替える opt-in スクリプトが同梱されており、**同一ホスト**上の

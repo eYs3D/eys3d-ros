@@ -1,12 +1,12 @@
-# R77 video-mode catalogue.
-# Source: YMS023_R77-A Datasheet Rev 0.6 (2025-02-26), Table 4.1.
+# R77 video-mode catalog.
+# Source: eYs3D R77 product datasheet.
 #
 # Usage:
 #   ros2 launch eys3d_camera R77.launch.py mode_id:=<id>
 #
 # Camera:
 #   USB 2.0 depth camera, 1280x920 sensor. Depth is 14-bit distance in
-#   millimetres.
+#   millimeters.
 #
 # Mode schema (every field is required on every entry):
 #   color.w / color.h     pixel resolution (0/0 = color stream off)
@@ -18,12 +18,29 @@
 #   fps                   physical frame rate
 #   interleave            true = SDK splits color/depth from a unified stream
 #                         (effective per-stream rate is fps / 2)
+#   usb                   USB port type the mode needs (2 = USB2.0, 3 = USB3.0)
+#
+# Model header (every field is required):
+#   pid                   USB product ID; open() refuses a mismatched device
+#   mono                  true = monochrome sensor pair (color stream is luma)
+#   ir                    projector level range and the default applied when
+#                         the ir_value parameter is -1
+#   depth_range_mm        PointCloud working-range defaults; the depth_near_mm /
+#                         depth_far_mm launch parameters (> 0) override
+#   signature_mode        USB port type -> default mode_id opened when mode_id
+#                         is -1 (auto) for the negotiated link
 
 model: R77
+pid: 0x0180
+mono: true
+ir: {min: 0, max: 6, default: 3}
+depth_range_mm: {near: 200, far: 1500}
+signature_mode: {2: 2}   # USB port type -> default mode
 
 modes:
   1:
     name: "L'+D 1280x920@7"
+    usb: 2
     color: {w: 1280, h: 920, fmt: 1, split_lr: false}
     depth: {w: 1280, h: 920, dtype: 2}
     zd_index: 0
@@ -32,6 +49,7 @@ modes:
 
   2:
     name: "L'+D 1280x920@30 + 640x460 depth"
+    usb: 2
     color: {w: 1280, h: 920, fmt: 1, split_lr: false}
     depth: {w:  640, h: 460, dtype: 34}
     zd_index: 0
@@ -40,6 +58,7 @@ modes:
 
   3:
     name: "L'+D 1280x920@15 + 640x460 depth"
+    usb: 2
     color: {w: 1280, h: 920, fmt: 1, split_lr: false}
     depth: {w:  640, h: 460, dtype: 34}
     zd_index: 0
@@ -48,6 +67,7 @@ modes:
 
   4:
     name: "D-only 640x460@30"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 460, dtype: 34}
     zd_index: 0
@@ -56,6 +76,7 @@ modes:
 
   5:
     name: "D-only 640x460@15"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 460, dtype: 34}
     zd_index: 0
@@ -64,6 +85,7 @@ modes:
 
   6:
     name: "L'+R'+D 1280(x2)x920@6 + 1280x920 depth"
+    usb: 2
     color: {w: 2560, h: 920, fmt: 1, split_lr: true}
     depth: {w: 1280, h: 920, dtype: 2}
     zd_index: 0
@@ -72,6 +94,7 @@ modes:
 
   7:
     name: "L'+R'+D 1280(x2)x920@15 + 640x460 depth"
+    usb: 2
     color: {w: 2560, h: 920, fmt: 1, split_lr: true}
     depth: {w:  640, h: 460, dtype: 34}
     zd_index: 0
@@ -80,6 +103,7 @@ modes:
 
   8:
     name: "L+R 1280(x2)x920@4"
+    usb: 2
     color: {w: 2560, h: 920, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 0}
     zd_index: 0
@@ -88,6 +112,7 @@ modes:
 
   9:
     name: "L'+R' 1280(x2)x920@4"
+    usb: 2
     color: {w: 2560, h: 920, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 0

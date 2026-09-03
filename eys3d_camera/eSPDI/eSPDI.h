@@ -1193,6 +1193,44 @@ int  APC_GetImage(void *pHandleEYSD, PDEVSELINFO pDevSelInfo,
                         int *pSerial = 0, int nDepthDataType = 0,
                         unsigned char **pUserBuf = nullptr);
 
+/*! \fn int APC_GetImageWithTimestamp(
+        void *pHandleEYSD,
+        PDEVSELINFO pDevSelInfo,
+        BYTE *pBuf,
+        unsigned long int *pImageSize,
+        int *pSerial, int nDepthDataType,
+        int64_t *pcur_tv_sec,
+        int64_t *pcur_tv_usec)
+    \brief get color or depth pin image
+        by issuing V4L2's IOCTL to get frame data
+    \param void *pHandleEYSD	handle
+    \param PDEVSELINFO pDevSelInfo	pointer of device select index
+    \param BYTE *pBuf	buffer to store image data
+    \param unsigned long int *pImageSize	the actual buffer size getting from device
+    \param int *pSerial	the serial number for synchronizing color and depth image
+    \param int nDepthDataType	the depth data type, see definition in eSPDI_def.h
+    \param int64_t *pcur_tv_sec seconds in 'v4l2_buffer' timestamp of this image data
+    \param int64_t *pcur_tv_usec microseconds in 'v4l2_buffer' timestamp of this image data
+    \param unsigned char **pUserBuf	[USERPTR mode] Returns pointer to user-provided buffer containing image data
+    \return success: APC_OK, others: see eSPDI_def.h
+
+    \note Dual-mode, same semantics as APC_GetImage:
+    - MMAP mode: pBuf is required; frame data is copied into pBuf.
+    - USERPTR mode (device opened with IMAGE_USERPTR_MODE): pUserBuf is required and
+      receives the V4L2 buffer pointer, which must be recycled with APC_RecycleBuffer().
+    - In both modes the V4L2 'v4l2_buffer' timestamp is returned via pcur_tv_sec/pcur_tv_usec.
+*/
+int APC_GetImageWithTimestamp(
+    void *pHandleEYSD,
+    PDEVSELINFO pDevSelInfo,
+    BYTE *pBuf,
+    unsigned long int *pImageSize,
+    int *pSerial,
+    int nDepthDataType,
+    int64_t *pcur_tv_sec,
+    int64_t *pcur_tv_usec,
+    unsigned char **pUserBuf = nullptr);
+
 /*! \fn int APC_GetColorImage(
         void *pHandleEYSD,
         PDEVSELINFO pDevSelInfo,

@@ -1,0 +1,37 @@
+# Goal — run one in-stream self-calibration session.
+# auto_commit_shift_px: gates automatic flash commit on a verified-better result.
+#   If >= 0 and the measured cy shift (cy_shift_px) reaches it, the server commits
+#   to flash automatically. < 0 (default) never auto-commits; the caller reviews
+#   the result and calls the /selfcal/commit service. The recommended value when
+#   enabling auto-commit is 0.25 (one calibration step; the smallest real move).
+#   Only a verified-better outcome is ever committed — a worse, unstable,
+#   no-change, or failed run never writes flash.
+# profile: optional profile filename (without .json); empty uses the node's
+#   selfcal_profile parameter.
+float32 auto_commit_shift_px -1.0
+string profile
+---
+# Result — delivered when the session ends and the server has resolved it.
+string  outcome              # SUCCESS / NO_CHANGE / INSUFFICIENT_INPUT / TIMEOUT / FAILED
+float32 valid_ratio_first    # fill rate at the first accepted frame; diagnostic only
+float32 valid_ratio_latest   # fill rate at the last frame; diagnostic only
+float32 valid_ratio_delta    # latest - first; diagnostic only, not the commit gate
+float32 correction_level     # normalized correction magnitude, 0..1 (diagnostic)
+float32 cy_shift_px          # measured vertical cy shift in pixels (the commit gate)
+# Controlled A/B re-check measured on the live stream after convergence: the
+# driver toggles the converged and pre-session cy and compares fill-rate, so the
+# verdict reflects the actual before/after on this scene (not the noisy
+# session-long valid_ratio_delta).
+string  recheck_verdict      # improved / worse / inconclusive / skipped
+float32 recheck_ratio_before # mean fill-rate at the pre-session cy
+float32 recheck_ratio_after  # mean fill-rate at the converged cy
+bool    applied              # a correction is live in the registers
+bool    reverted             # rolled back to the pre-session calibration
+bool    committed            # written to the user calibration slot
+string  message
+---
+# Feedback — streamed while the session converges.
+string  phase                # INITIAL_SEARCH / REFINEMENT / ...
+float32 progress             # 0..1
+uint32  processed_frames
+float32 valid_ratio_latest   # current fill rate

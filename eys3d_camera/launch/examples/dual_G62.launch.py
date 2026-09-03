@@ -8,11 +8,11 @@ cannot tell two G62 modules apart.
 
 Edit the two usb_port values below to match your wiring before launching:
 
-    ros2 launch eys3d_camera examples/dual_G62.launch.py
+    ros2 launch eys3d_camera dual_G62.launch.py
 
 Per-camera topics:
-    /G62_left/{left_color, depth_image, pointcloud, ...}
-    /G62_right/{left_color, depth_image, pointcloud, ...}
+    /G62_left/{left_color/image_raw, depth/image_raw, depth/points, ...}
+    /G62_right/{left_color/image_raw, depth/image_raw, depth/points, ...}
 """
 
 import os
@@ -23,7 +23,9 @@ from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 
 
-def _camera(camera_name: str, usb_port: str, mode_id: str = '2'):
+def _camera(camera_name: str, usb_port: str, mode_id: str = '2',
+            ir_value: str = '-1', depth_near_mm: str = '-1',
+            depth_far_mm: str = '-1', urdf: str = 'false'):
     return IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
             get_package_share_directory('eys3d_camera'),
@@ -33,6 +35,10 @@ def _camera(camera_name: str, usb_port: str, mode_id: str = '2'):
             'mode_id':            mode_id,
             'camera_name':        camera_name,
             'usb_port':           usb_port,
+            'ir_value':           ir_value,
+            'depth_near_mm':      depth_near_mm,
+            'depth_far_mm':       depth_far_mm,
+            'urdf':               urdf,
             'rviz':               'false',
             'log':                'sdk',
         }.items(),

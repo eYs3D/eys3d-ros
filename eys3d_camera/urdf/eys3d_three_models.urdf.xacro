@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<!-- All three eYs3D camera models side by side, for the standalone
+     three-model demo (launch/examples/three_models.launch.py). No
+     hardware required. Each model is instantiated from its own
+     urdf/eys3d_<MODEL>.urdf.xacro macro under a shared base_link,
+     offset along Y so the meshes and their mounting-hole frames can
+     be inspected together in rviz. -->
+<robot name="eys3d_three_models" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:include filename="$(find eys3d_camera)/urdf/eys3d_G100P.urdf.xacro"/>
+  <xacro:include filename="$(find eys3d_camera)/urdf/eys3d_G62.urdf.xacro"/>
+  <xacro:include filename="$(find eys3d_camera)/urdf/eys3d_R77.urdf.xacro"/>
+
+  <link name="base_link"/>
+
+  <xacro:eys3d_G62  name="G62_1"   parent="base_link">
+    <origin xyz="0  0.12 0" rpy="0 0 0"/>
+  </xacro:eys3d_G62>
+  <xacro:eys3d_G100P name="G100P_1" parent="base_link">
+    <origin xyz="0  0    0" rpy="0 0 0"/>
+  </xacro:eys3d_G100P>
+  <xacro:eys3d_R77  name="R77_1"   parent="base_link">
+    <origin xyz="0 -0.12 0" rpy="0 0 0"/>
+  </xacro:eys3d_R77>
+</robot>

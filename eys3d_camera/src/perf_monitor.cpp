@@ -1,19 +1,9 @@
-// Live performance monitor for the eys3d_camera driver.
+// Live performance monitor for the eys3d_camera driver. Subscribes with
+// SensorDataQoS so the driver leaves its no-subscriber idle state.
 //
-// Subscribes (with the correct SensorDataQoS) to the driver's image and
-// point-cloud topics so the driver leaves its "no subscriber" idle state,
-// then prints a per-second snapshot combining the locally observed
-// receive rate with the driver's internal /diagnostics counters.
-//
-// Each printed block shows, per stream, the three rates that matter:
-//   SDK : frames received from the camera (camera / USB health)
-//   Pub : frames the driver actually emitted to the topic (driver load)
-//   Rx  : frames this monitor received over DDS (transport health)
-//
-// Image and point-cloud subscriptions take a `SerializedMessage`
-// callback so each delivery only counts the message — the per-frame
-// rmw → ROS message deserialisation is bypassed entirely. This keeps
-// the monitor below 1 % of one core even on low-power ARM hosts.
+//   SDK : frames received from the camera
+//   Pub : frames the driver emitted to the topic
+//   Rx  : frames this monitor received over DDS
 //
 // Usage:
 //   ros2 run eys3d_camera perf_monitor                # auto-detect namespace
@@ -45,13 +35,12 @@ bool ends_with(const std::string& s, const std::string& suffix) {
            s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-// Discover the first /<ns>/left_color or /<ns>/depth_image topic on the
-// graph. Returns an empty string when nothing matches.
+// First matching stream on the graph; empty when nothing matches.
 std::string autodetect_namespace(rclcpp::Node::SharedPtr probe) {
     // Give DDS discovery a brief moment.
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     const auto topics = probe->get_topic_names_and_types();
-    for (const char* suffix : {"/left_color", "/depth_image"}) {
+    for (const char* suffix : {"/left_color/image_raw", "/depth/image_raw"}) {
         const std::string suffix_s = suffix;
         for (const auto& [name, types] : topics) {
             if (!ends_with(name, suffix_s)) continue;
@@ -82,13 +71,13 @@ public:
             };
         };
         sub_color_ = create_subscription<sensor_msgs::msg::Image>(
-            namespace_ + "/left_color",  qos, bump(rx_color_));
+            namespace_ + "/left_color/image_raw",  qos, bump(rx_color_));
         sub_right_color_ = create_subscription<sensor_msgs::msg::Image>(
-            namespace_ + "/right_color", qos, bump(rx_right_color_));
+            namespace_ + "/right_color/image_raw", qos, bump(rx_right_color_));
         sub_depth_ = create_subscription<sensor_msgs::msg::Image>(
-            namespace_ + "/depth_image", qos, bump(rx_depth_));
+            namespace_ + "/depth/image_raw", qos, bump(rx_depth_));
         sub_pc_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-            namespace_ + "/pointcloud",  qos, bump(rx_pc_));
+            namespace_ + "/depth/points",  qos, bump(rx_pc_));
 
         // /diagnostics is small and the KeyValue contents are read on
         // every tick, so a regular deserialised subscription is fine.
@@ -113,16 +102,16 @@ private:
         // The five tasks (device, color, depth, pointcloud, thermal)
         // are flattened into a single "<task>.<key>" lookup so the
         // print formatter resolves each metric by its task / key pair.
-        std::map<std::string, std::string> next;
+        std::map<std::string, std::string> flattened;
         for (const auto& st : msg.status) {
             const auto sep = st.name.find(": ");
             if (sep == std::string::npos) continue;
             const std::string task = st.name.substr(sep + 2);
             for (const auto& kv : st.values) {
-                next[task + "." + kv.key] = kv.value;
+                flattened[task + "." + kv.key] = kv.value;
             }
         }
-        diag_ = std::move(next);
+        diag_ = std::move(flattened);
     }
 
     std::string lookup_float(const std::string& key) const {
@@ -151,10 +140,10 @@ private:
     void print_tick() {
         const auto t_now = now();
         const double dt = std::max(1e-3, (t_now - last_tick_).seconds());
-        const double r_color       = (rx_color_       - last_rx_color_)       / dt;
-        const double r_right_color = (rx_right_color_ - last_rx_right_color_) / dt;
-        const double r_depth       = (rx_depth_       - last_rx_depth_)       / dt;
-        const double r_pc          = (rx_pc_          - last_rx_pc_)          / dt;
+        const double rx_color_hz       = (rx_color_       - last_rx_color_)       / dt;
+        const double rx_right_color_hz = (rx_right_color_ - last_rx_right_color_) / dt;
+        const double rx_depth_hz       = (rx_depth_       - last_rx_depth_)       / dt;
+        const double rx_pc_hz          = (rx_pc_          - last_rx_pc_)          / dt;
         last_rx_color_       = rx_color_;
         last_rx_right_color_ = rx_right_color_;
         last_rx_depth_       = rx_depth_;
@@ -170,23 +159,23 @@ private:
             << "=== eys3d_camera perf [" << namespace_ << "] @ " << ts << " ===\n"
             << "  color | SDK " << lookup_float("color.input_fps")
             << " \xe2\x86\x92 Pub " << lookup_float("color.publish_fps")
-            << " \xe2\x86\x92 Rx " << fmt_rx(r_color)
+            << " \xe2\x86\x92 Rx " << fmt_rx(rx_color_hz)
             << "  | decode avg " << lookup_float("color.decode_avg_ms") << " ms"
             << "   max " << lookup_float("color.decode_max_ms") << " ms"
             << "   dropped " << lookup_str("color.input_dropped") << "\n";
         if (rx_right_color_ > 0) {
             std::cout
                 << "  right | (split_color)                                 "
-                << "                Rx " << fmt_rx(r_right_color) << "\n";
+                << "                Rx " << fmt_rx(rx_right_color_hz) << "\n";
         }
         std::cout
             << "  depth | SDK " << lookup_float("depth.input_fps")
             << " \xe2\x86\x92 Pub " << lookup_float("depth.publish_fps")
-            << " \xe2\x86\x92 Rx " << fmt_rx(r_depth)
+            << " \xe2\x86\x92 Rx " << fmt_rx(rx_depth_hz)
             << "  |                                       "
             << "   dropped " << lookup_str("depth.input_dropped") << "\n"
             << "  pc    |              Pub " << lookup_float("pointcloud.publish_fps")
-            << " \xe2\x86\x92 Rx " << fmt_rx(r_pc)
+            << " \xe2\x86\x92 Rx " << fmt_rx(rx_pc_hz)
             << "  | compute avg " << lookup_float("pointcloud.compute_avg_ms") << " ms"
             << "   max " << lookup_float("pointcloud.compute_max_ms") << " ms"
             << "   total " << lookup_str("pointcloud.publish_total") << "\n"

@@ -3,40 +3,25 @@
 
 // API stability note
 // ------------------
-// The CameraNode class is registered as an rclcpp::Node and as an
-// rclcpp::components plugin "eys3d_camera::CameraNode". 1.0.0 is the
-// first version where this pact applies:
+// CameraNode is an rclcpp::Node and the rclcpp::components plugin
+// "eys3d_camera::CameraNode". Stable across the 2.x series:
 //
-//   Stable across the 1.x series:
-//     * published topics + types + frame IDs
-//     * service names + types ("pause", "standby" — both
-//       std_srvs/srv/SetBool, see camera_node.cpp for semantics; the
-//       pre-1.0 "enable_color" / "enable_depth" services were replaced
-//       and will NOT come back)
-//     * declared parameters + types + read-only flags
-//     * QoS profiles on every endpoint (image_qos() and info_qos() in
-//       camera_node.cpp)
-//     * the /diagnostics KeyValue keys listed in the README diagnostics
-//       table (the "stream_state" key replaces the pre-1.0
-//       "color_enabled" / "depth_enabled" pair)
-//     * the component plugin name above (so composition consumers keep
-//       working without code changes)
+//   * published topics, their types and the frame ids
+//   * service names and types: pause, standby (std_srvs/srv/SetBool),
+//     hw_reset (std_srvs/srv/Empty)
+//   * declared parameters, their types and read-only flags
+//   * QoS on every endpoint (image_qos() / info_qos() in camera_node.cpp)
+//   * the /diagnostics KeyValue keys the README lists
+//   * the component plugin name
 //
-// Everything else in this header — the private member layout, the
-// types pulled in from espdi_device.hpp / video_modes.hpp, and the
-// nested helper functions — is implementation detail and may change
-// without bumping the major version. Do NOT subclass CameraNode, do
-// NOT depend on the field layout, and do NOT take the address of any
-// member. Treat this header as opaque except for the constructor and
-// destructor.
+// Everything else in this header is implementation detail. Do not subclass
+// CameraNode, depend on the field layout, or take the address of a member.
 //
-// Lifecycle: CameraNode is destroyed only after rclcpp::shutdown() has
-// returned (or the owning executor's spin loop has exited). The
-// destructor relies on this to guarantee no service callback is
-// dispatched while it tears down device_; if the rclcpp executor is
-// still spinning when the node goes out of scope, the standby() /
-// pause() callbacks can race with member destruction.
+// Lifecycle: CameraNode must be destroyed only after rclcpp::shutdown() has
+// returned. The destructor relies on that to guarantee no service callback is
+// dispatched while it tears down device_.
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -45,10 +30,14 @@
 #include <diagnostic_updater/diagnostic_updater.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <eys3d_camera_interfaces/action/self_cal.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_srvs/srv/set_bool.hpp>
+#include <std_srvs/srv/empty.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 
@@ -64,8 +53,11 @@ public:
 
 private:
     void declare_params();
-    bool load_video_mode(VideoMode& out, std::string& err_topic) const;
+    // Loads the model's catalogue (mode entry + per-model header) from
+    // launch/video_modes/<MODEL>.yaml; fills model_info_.
+    bool load_video_mode(VideoMode& out, std::string& err_msg);
     DeviceConfig build_device_config(const VideoMode& vm) const;
+    ModelInfo model_info_;
 
     void on_color(FrameBuffer&& f);
     void on_depth(FrameBuffer&& f);
@@ -75,10 +67,20 @@ private:
                         uint64_t hw_timestamp_us);
 
     rclcpp::Time stamp_from_hw_us(uint64_t hw_us);
+    // Depth is rectified in every mode; color follows the mode's depth type.
+    enum class InfoStream { kLeftColor, kRightColor, kDepth, kCount };
+
+    // Describes the image on that topic only. Rectified form: K is P's left
+    // 3x3, D zero, R identity. Raw form: the factory lens model.
     sensor_msgs::msg::CameraInfo build_camera_info(
         const std::string& frame_id, const rclcpp::Time& stamp,
-        int width, int height, const EspdiDevice::LensCalibration& lens,
-        bool valid) const;
+        int width, int height, const EspdiDevice::Calibration& calib,
+        InfoStream stream) const;
+    void warn_if_off_raster(const sensor_msgs::msg::CameraInfo& ci,
+                            InfoStream stream) const;
+    // Cleared on reconnect, which may land on a different calibration.
+    mutable std::array<std::atomic<bool>,
+                       static_cast<size_t>(InfoStream::kCount)> off_raster_warned_{};
 
     // Locked snapshot of cached_calib_ for per-frame CameraInfo publishes.
     EspdiDevice::Calibration snapshot_calib() const;
@@ -94,9 +96,8 @@ private:
     // an O(4) broadcast, then zero (latched by tf2).
     void publish_static_tf();
 
-    // Republish all three camera_info topics on a low-rate timer (default 1 Hz).
-    // rclcpp parameter-set callback. Accepts ir_intensity,
-    // enable_auto_exposure, exposure_time_step, enable_auto_white_balance,
+    // rclcpp parameter-set callback. Accepts ir_value,
+    // auto_exposure, exposure_time_step, auto_white_balance,
     // power_line_frequency and dispatches to the EspdiDevice
     // setters. Unknown parameters and out-of-range values are rejected.
     rcl_interfaces::msg::SetParametersResult on_set_parameters(
@@ -108,6 +109,14 @@ private:
     // NodeOptions::parameter_overrides) are written back to the device.
     void declare_and_apply_runtime_params();
 
+    // Re-sync the parameter store from the camera's persisted CT/PU state
+    // after a reopen. Those values live in the module's flash and survive a
+    // USB re-enumerate, so the firmware is the source of truth: read it back
+    // rather than re-pushing the store. Called from try_reconnect() and
+    // standby(false); ir_value is re-applied separately by those callers
+    // because the projector boots OFF on open.
+    void resync_ct_pu_from_device();
+
     OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
     // Runtime stream-control services. /<cam>/pause is a cheap atomic
     // gate (USB keeps running, frames are dropped before decode/publish);
@@ -116,6 +125,28 @@ private:
     // intentional idle as a disconnect.
     rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr srv_pause_;
     rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr srv_standby_;
+    rclcpp::Service<std_srvs::srv::Empty>::SharedPtr srv_hw_reset_;
+    // Self-calibration (selfk) control, created only when selfcal_enable is set.
+    // The run action drives one full session to completion and resolves it;
+    // commit persists a kept result to flash. No start/stop — a session runs to
+    // completion and cannot be interrupted (a running one auto-reverts if worse).
+    using SelfCalAction = eys3d_camera_interfaces::action::SelfCal;
+    using SelfCalGoalHandle = rclcpp_action::ServerGoalHandle<SelfCalAction>;
+    rclcpp_action::Server<SelfCalAction>::SharedPtr act_selfcal_run_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_selfcal_commit_;
+    std::shared_ptr<SelfCalGoalHandle> selfcal_run_goal_;
+    rclcpp::TimerBase::SharedPtr selfcal_run_timer_;
+    rclcpp::Time selfcal_run_deadline_;
+    float selfcal_run_auto_commit_shift_px_ = -1.0f;
+
+    rclcpp_action::GoalResponse selfcal_handle_goal(
+        const rclcpp_action::GoalUUID& uuid,
+        std::shared_ptr<const SelfCalAction::Goal> goal);
+    rclcpp_action::CancelResponse selfcal_handle_cancel(
+        std::shared_ptr<SelfCalGoalHandle> gh);
+    void selfcal_handle_accepted(std::shared_ptr<SelfCalGoalHandle> gh);
+    void selfcal_run_tick();  // wall-timer: feed feedback + resolve on completion
+
     std::atomic<bool> user_wants_standby_{false};
 
     // /diagnostics via diagnostic_updater::Updater. The five per-task
@@ -195,20 +226,34 @@ private:
     std::atomic<ConnState> conn_state_{ConnState::kStreaming};
     rclcpp::TimerBase::SharedPtr watchdog_timer_;
     EspdiDevice::Stats watchdog_prev_stats_{};
-    // Watchdog counters are written by the wall-timer callback AND by the
-    // standby() service handler (which re-arms the startup grace after a
-    // successful resume). On a multi-threaded executor these can run on
-    // different threads; atomic relaxed loads/stores are sufficient
-    // because the values are independent counters with no ordering
-    // dependency on other state.
-    std::atomic<int>  zero_frame_seconds_{0};      // consecutive 1-s ticks with no frames
-    std::atomic<bool> watchdog_armed_{false};      // disconnect-detect active only after first frame
+    // Written by the wall-timer callback and by the standby() handler, which
+    // on a multi-threaded executor can run on different threads. Relaxed
+    // atomics suffice: independent counters, no ordering dependency on other
+    // state.
+    // Per-stream disconnect detection. Which streams the active mode runs is
+    // fixed at construction; each is watched from the open, through the startup
+    // grace until it delivers a frame and through its own silence counter after.
+    bool color_configured_{false};
+    bool depth_configured_{false};
+    // Fixed at construction from the mode's depth data type.
+    bool color_rectified_{true};
+    std::atomic<bool> color_armed_{false};
+    std::atomic<bool> depth_armed_{false};
+    std::atomic<int>  color_silent_seconds_{0};    // consecutive 1-s ticks with no colour frame
+    std::atomic<int>  depth_silent_seconds_{0};    // consecutive 1-s ticks with no depth frame
     std::atomic<int>  startup_grace_seconds_{0};   // ticks elapsed before any frame seen
+    // Reopens spent on a stream that has never delivered. Cleared once every
+    // configured stream has armed, and not by the reopen itself -- that is what
+    // bounds the loop.
+    std::atomic<int>  cold_start_reopens_{0};
+    static constexpr int kMaxColdStartReopens = 3;
     // Counted on the watchdog timer; read on the diagnostics timer.
     // Atomic so a multi-threaded executor cannot tear the 64-bit value
     // on 32-bit ARM targets.
     std::atomic<uint64_t> reconnect_attempts_{0};
-    int reconnect_poll_counter_ = 0;        // throttles re-open attempts (watchdog-thread only)
+    // Written by the watchdog and by the standby and hw_reset handlers; they
+    // cannot overlap while the node's callbacks share one callback group.
+    int reconnect_poll_counter_ = 0;
     // Cached so the watchdog can re-issue open() + start() after a disconnect.
     // on_set_parameters() mutates the temporal_filter_* fields from the
     // executor thread; try_reconnect() reads the struct under cfg_mtx_ so
@@ -219,6 +264,9 @@ private:
     DepthFrameCb cached_depth_cb_;
     PointCloudCb cached_pc_cb_;
     void watchdog_tick();
+    // Stop and close the device, force Disconnected, and reset the watchdog
+    // arming / grace / poll state so the reconnect loop starts clean.
+    void declare_disconnected();
     bool try_reconnect();
 
     std::atomic<bool> time_anchor_set_{false};

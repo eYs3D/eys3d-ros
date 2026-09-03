@@ -1,0 +1,14 @@
+# eYs3D depth cameras — Etron Technology, USB vendor 3438 (e.g. 3438:0180).
+#
+# Grants non-root users access to the raw USB device so the eSPDI SDK can
+# issue its libusb control transfers (IR projector level, exposure, the
+# DM_Quality register block) and open the UVC video nodes without running the
+# driver as root.
+#
+# Install:
+#   sudo cp 99-eys3d.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then replug the camera. The installed copy lives under
+#   share/eys3d_camera/udev/99-eys3d.rules
+SUBSYSTEM=="usb", ATTR{idVendor}=="3438", MODE="0666", GROUP="video"
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="3438", MODE="0666", GROUP="video"

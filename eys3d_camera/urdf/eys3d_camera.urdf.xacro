@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<!-- Standalone description for a single eYs3D camera.
+
+     Usage:
+       xacro eys3d_camera.urdf.xacro model:=G100P
+       xacro eys3d_camera.urdf.xacro model:=G62 camera_name:=G62_left
+
+     camera_name defaults to <model>_1 — the same default the driver
+     and the shipped rviz layouts use. For integration into a robot,
+     include eys3d_<MODEL>.urdf.xacro directly and instantiate the
+     macro with your own parent link and origin. -->
+<robot name="eys3d_camera" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="model" default="G100P"/>
+  <xacro:arg name="camera_name" default=""/>
+
+  <!-- G100+i shares the G100+ body and mounting frames, so it reuses the
+       G100P description; the model argument still names the camera. -->
+  <xacro:property name="model_arg" value="$(arg model)"/>
+  <xacro:property name="desc_model"
+                  value="${'G100P' if model_arg == 'G100Pi' else model_arg}"/>
+
+  <xacro:include filename="$(find eys3d_camera)/urdf/eys3d_${desc_model}.urdf.xacro"/>
+
+  <link name="base_link"/>
+  <xacro:call macro="eys3d_${desc_model}"
+              name="${'$(arg camera_name)' or '$(arg model)_1'}"
+              parent="base_link">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:call>
+</robot>

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(eys3d_camera VERSION 1.0.0)
+project(eys3d_camera VERSION 2.0.0)
 
 # Cross-distro ROS 2 build. Dependencies resolve to the same package
 # names across supported distros.
@@ -60,7 +60,9 @@ find_package(diagnostic_msgs REQUIRED)
 find_package(diagnostic_updater REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(eys3d_camera_interfaces REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
@@ -81,7 +83,7 @@ else()
     message(STATUS "OpenMP not found: point-cloud reprojection will run single-threaded")
 endif()
 
-# eSPDI 5.1.0.6 ships in-package under eSPDI/ — header plus prebuilt
+# eSPDI 5.1.0.7 ships in-package under eSPDI/ — header plus prebuilt
 # .so for x86_64 and aarch64. The package is self-contained; no
 # external SDK installation is required.
 set(ESPDI_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/eSPDI")
@@ -106,10 +108,25 @@ else()
         "eSPDI ships prebuilt libs only for x86_64 and aarch64.")
 endif()
 
-set(ESPDI_LIB "${ESPDI_ROOT}/${ESPDI_LIB_NAME}")
-if(NOT EXISTS "${ESPDI_LIB}")
-    message(FATAL_ERROR "Expected eSPDI library not found: ${ESPDI_LIB}")
+# Resolve the versioned SDK binary (libeSPDI_<arch>.so.<x.y.z.w>). The
+# tree carries no symlinks, so source archives stay buildable. COMPARE
+# NATURAL needs CMake 3.18; Ubuntu 20.04 ships 3.16.
+file(GLOB _espdi_libs "${ESPDI_ROOT}/${ESPDI_LIB_NAME}.*")
+if(NOT _espdi_libs)
+    message(FATAL_ERROR "libeSPDI not found: ${ESPDI_ROOT}/${ESPDI_LIB_NAME}.*")
 endif()
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.18)
+    list(SORT _espdi_libs COMPARE NATURAL)
+else()
+    list(SORT _espdi_libs)
+    list(LENGTH _espdi_libs _espdi_lib_count)
+    if(_espdi_lib_count GREATER 1)
+        message(WARNING
+            "Several libeSPDI binaries in ${ESPDI_ROOT}; CMake ${CMAKE_VERSION} "
+            "cannot order them by version, so the newest may not be picked.")
+    endif()
+endif()
+list(GET _espdi_libs -1 ESPDI_LIB)
 message(STATUS "eys3d_camera: linking ${ESPDI_LIB}")
 
 # Emit DT_RPATH (rather than the default DT_RUNPATH) so dlopen still
@@ -122,9 +139,28 @@ else()
     set(EYS3D_CAMERA_RPATH_FLAGS "-Wl,--disable-new-dtags")
 endif()
 
+# APC error-code name table, generated from the SDK header so runtime
+# error messages carry the define name (APC_NOT_SUPPORT_RES) instead of
+# a bare rc. Regenerates automatically when the SDK header changes.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(ESPDI_ERROR_INC "${CMAKE_CURRENT_BINARY_DIR}/generated/espdi_error_names.inc")
+add_custom_command(
+    OUTPUT "${ESPDI_ERROR_INC}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gen_espdi_error_names.py"
+            "${ESPDI_ROOT}/eSPDI_def.h" "${ESPDI_ERROR_INC}"
+    DEPENDS "${ESPDI_ROOT}/eSPDI_def.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gen_espdi_error_names.py"
+    COMMENT "Generating APC error-code name table"
+)
+add_custom_target(gen_espdi_error_names DEPENDS "${ESPDI_ERROR_INC}")
+
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${ESPDI_ROOT}
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 
 set(DEPENDENCIES
@@ -133,7 +169,9 @@ set(DEPENDENCIES
     diagnostic_updater
     geometry_msgs
     rclcpp
+    rclcpp_action
     rclcpp_components
+    eys3d_camera_interfaces
     sensor_msgs
     std_msgs
     std_srvs
@@ -142,20 +180,70 @@ set(DEPENDENCIES
     yaml_cpp_vendor
 )
 
+# eYs3D self-calibration (selfk) core, bundled in-package under selfk/: the
+# public header plus a static archive per architecture, linked into the
+# component. Set -DEYS3D_WITH_SELFCAL=OFF to build without it.
+option(EYS3D_WITH_SELFCAL "Build with self-calibration (selfk) support" ON)
+if(EYS3D_WITH_SELFCAL)
+    set(SELFK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/selfk")
+    # Normalise the arch to the name the archives ship under (uname -m:
+    # x86_64 / aarch64), matching the eSPDI block, so an arm64/AMD64 alias from a
+    # cross toolchain still resolves the archive.
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" OR
+       CMAKE_SYSTEM_PROCESSOR STREQUAL "AMD64")
+        set(SELFK_ARCH "x86_64")
+    elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" OR
+           CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+        set(SELFK_ARCH "aarch64")
+    else()
+        set(SELFK_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+    set(SELFK_PREBUILT
+        "${SELFK_DIR}/lib/${SELFK_ARCH}/libeys3d_selfk_${SELFK_ARCH}.a")
+    # Build rules that only apply where the sources they build are present.
+    file(GLOB _selfk_local "${CMAKE_CURRENT_SOURCE_DIR}/cmake/local/selfk_*.cmake")
+    if(_selfk_local)
+        foreach(_rule IN LISTS _selfk_local)
+            include("${_rule}")
+        endforeach()
+    elseif(EXISTS "${SELFK_PREBUILT}")
+        add_library(eys3d_selfk STATIC IMPORTED)
+        set_target_properties(eys3d_selfk PROPERTIES
+            IMPORTED_LOCATION "${SELFK_PREBUILT}"
+            INTERFACE_INCLUDE_DIRECTORIES "${SELFK_DIR}/include"
+            # The archive was built against the in-package eSPDI; the final .so
+            # must resolve those symbols.
+            INTERFACE_LINK_LIBRARIES "${ESPDI_LIB}")
+    else()
+        message(FATAL_ERROR
+            "EYS3D_WITH_SELFCAL is ON but no self-calibration archive for "
+            "${CMAKE_SYSTEM_PROCESSOR} was found (${SELFK_PREBUILT}). Set "
+            "-DEYS3D_WITH_SELFCAL=OFF to build without it, or ask eYs3D for an "
+            "archive built for this architecture.")
+    endif()
+endif()
+
 add_library(eys3d_camera_component SHARED
     src/espdi_device.cpp
     src/camera_node.cpp
     src/hole_filling.cpp
     src/spatial_filter.cpp
     src/register_settings.cpp
+    src/selfcal_manager.cpp
     src/simd_kernels.cpp
     src/temporal_filter.cpp
     src/video_modes.cpp
     src/zd_lookup.cpp
 )
+if(EYS3D_WITH_SELFCAL)
+    target_link_libraries(eys3d_camera_component eys3d_selfk)
+    target_compile_definitions(eys3d_camera_component PRIVATE EYS3D_WITH_SELFCAL)
+    target_include_directories(eys3d_camera_component PRIVATE ${SELFK_DIR}/include)
+endif()
 target_compile_definitions(eys3d_camera_component
     PRIVATE "COMPOSITION_BUILDING_DLL"
 )
+add_dependencies(eys3d_camera_component gen_espdi_error_names)
 target_link_libraries(eys3d_camera_component
     ${ESPDI_LIB}    # also exports libjpeg-turbo 2.0.4 (tjDecompress2 etc.)
     Threads::Threads
@@ -221,12 +309,11 @@ install(TARGETS
     RUNTIME DESTINATION lib
 )
 
-# Install the eSPDI runtime alongside the component .so. Both
-# the SONAME symlink and the underlying file are required so the loader
-# follows DT_NEEDED through one indirection.
+# Install the eSPDI runtime alongside the component .so. The SDK's
+# SONAME is version-tagged, so the versioned file alone satisfies
+# DT_NEEDED.
 install(FILES
     "${ESPDI_LIB}"
-    "${ESPDI_LIB}.5.1.0.6"
     DESTINATION lib
 )
 
@@ -241,12 +328,10 @@ if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" OR
 else()
     set(OPENCL_STUB_DIR "${ESPDI_ROOT}/OpenCL/aarch64/lib")
 endif()
-# Use install(DIRECTORY) so the symlinks libOpenCL.so -> .so.1 -> .so.1.2
-# are preserved instead of being resolved to three full copies by
-# install(FILES) under a non-symlink-install build.
-install(DIRECTORY "${OPENCL_STUB_DIR}/"
+# The stub ships as a single plain file named after its SONAME
+# (libOpenCL.so.1) — the only name the loader asks for at runtime.
+install(FILES "${OPENCL_STUB_DIR}/libOpenCL.so.1"
     DESTINATION lib/OpenCL
-    FILES_MATCHING PATTERN "libOpenCL.so*"
 )
 
 install(TARGETS
@@ -283,9 +368,31 @@ if(EXISTS "${FILTER_PROFILES_SRC}")
         DESTINATION share/${PROJECT_NAME}/cfg)
 endif()
 
-install(DIRECTORY launch rviz config
+# PATTERN __pycache__ EXCLUDE: importing a launch file byte-compiles it beside
+# the source, and a wholesale DIRECTORY install would put build-host bytecode
+# in the installed package.
+install(DIRECTORY launch rviz config urdf udev
     DESTINATION share/${PROJECT_NAME}
+    PATTERN "__pycache__" EXCLUDE
 )
+
+# The three .dae meshes the URDFs reference, by name rather than by directory,
+# so nothing else left in meshes/ reaches the installed package.
+install(FILES
+    meshes/G100P.dae
+    meshes/G62.dae
+    meshes/R77.dae
+    DESTINATION share/${PROJECT_NAME}/meshes
+)
+
+# Launch-file check. Needs no camera and no ROS graph, so it runs wherever
+# `colcon test` does, including on the customer's own build.
+if(BUILD_TESTING)
+    find_package(ament_cmake_pytest REQUIRED)
+    ament_add_pytest_test(test_launch_files test/test_launch_files.py
+        TIMEOUT 120
+    )
+endif()
 
 ament_export_include_directories(include)
 ament_export_libraries(eys3d_camera_component)

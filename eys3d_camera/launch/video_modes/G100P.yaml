@@ -1,12 +1,13 @@
-# G100+ (G100Plus / G100P) video-mode catalogue.
-# Source: YMS018_G100+ Datasheet Rev 0.6 (2025-04-16), Table 4.1.
+# G100+ (G100Plus / G100P) video-mode catalog.
+# Source: eYs3D G100+ product datasheet.
 #
 # Usage:
 #   ros2 launch eys3d_camera G100P.launch.py mode_id:=<id>
 #
 # Camera:
-#   USB 3.2 Gen1 depth camera with a USB 2.0 fallback path. 1280x720 mono
-#   sensor pair. Depth is 14-bit distance in millimetres.
+#   USB 3.2 Gen1 depth camera with a USB 2.0 fallback path. Dual 1280x800
+#   color image sensors (global shutter). Depth is 14-bit distance in
+#   millimeters.
 #
 # Mode schema (every field is required on every entry):
 #   color.w / color.h     pixel resolution (0/0 = color stream off)
@@ -18,13 +19,30 @@
 #   fps                   physical frame rate
 #   interleave            true = SDK splits color/depth from a unified stream
 #                         (effective per-stream rate is fps / 2)
+#   usb                   USB port type the mode needs (2 = USB2.0, 3 = USB3.0)
+#
+# Model header (every field is required):
+#   pid                   USB product ID; open() refuses a mismatched device
+#   mono                  true = monochrome sensor pair (color stream is luma)
+#   ir                    projector level range and the default applied when
+#                         the ir_value parameter is -1
+#   depth_range_mm        PointCloud working-range defaults; the depth_near_mm /
+#                         depth_far_mm launch parameters (> 0) override
+#   signature_mode        USB port type -> default mode_id opened when mode_id
+#                         is -1 (auto) for the negotiated link
 
 model: G100P
+pid: 0x0181
+mono: false
+ir: {min: 0, max: 6, default: 3}
+depth_range_mm: {near: 250, far: 1900}
+signature_mode: {2: 56, 3: 1}   # USB port type -> default mode
 
 modes:
   # === L'+D 1280x720 ===
   1:
     name: "L'+D 1280x720@60 interleave (SDK 30fps)"
+    usb: 3
     color: {w: 1280, h: 720, fmt: 0, split_lr: false}
     depth: {w: 1280, h: 720, dtype: 18}
     zd_index: 0
@@ -32,6 +50,7 @@ modes:
     interleave: true
   2:
     name: "L'+D 1280x720@60"
+    usb: 3
     color: {w: 1280, h: 720, fmt: 0, split_lr: false}
     depth: {w: 1280, h: 720, dtype:  2}
     zd_index: 0
@@ -39,6 +58,7 @@ modes:
     interleave: false
   3:
     name: "L'+D 1280x720@30 interleave (SDK 15fps)"
+    usb: 3
     color: {w: 1280, h: 720, fmt: 0, split_lr: false}
     depth: {w: 1280, h: 720, dtype: 18}
     zd_index: 0
@@ -46,6 +66,7 @@ modes:
     interleave: true
   4:
     name: "L'+D 1280x720@30"
+    usb: 3
     color: {w: 1280, h: 720, fmt: 0, split_lr: false}
     depth: {w: 1280, h: 720, dtype:  2}
     zd_index: 0
@@ -53,6 +74,7 @@ modes:
     interleave: false
   5:
     name: "L'+D 1280x720@20 interleave (SDK 10fps)"
+    usb: 3
     color: {w: 1280, h: 720, fmt: 0, split_lr: false}
     depth: {w: 1280, h: 720, dtype: 18}
     zd_index: 0
@@ -60,6 +82,7 @@ modes:
     interleave: true
   6:
     name: "L'+D 1280x720@10"
+    usb: 3
     color: {w: 1280, h: 720, fmt: 0, split_lr: false}
     depth: {w: 1280, h: 720, dtype:  2}
     zd_index: 0
@@ -69,6 +92,7 @@ modes:
   # === L'+D 640x480 ===
   7:
     name: "L'+D 640x480@60 interleave (SDK 30fps)"
+    usb: 3
     color: {w: 640, h: 480, fmt: 0, split_lr: false}
     depth: {w: 640, h: 480, dtype: 18}
     zd_index: 1
@@ -76,6 +100,7 @@ modes:
     interleave: true
   8:
     name: "L'+D 640x480@30 interleave (SDK 15fps)"
+    usb: 3
     color: {w: 640, h: 480, fmt: 0, split_lr: false}
     depth: {w: 640, h: 480, dtype: 18}
     zd_index: 1
@@ -83,6 +108,7 @@ modes:
     interleave: true
   9:
     name: "L'+D 640x480@20 interleave (SDK 10fps)"
+    usb: 3
     color: {w: 640, h: 480, fmt: 0, split_lr: false}
     depth: {w: 640, h: 480, dtype: 18}
     zd_index: 1
@@ -92,6 +118,7 @@ modes:
   # === L'+D 640x360 ===
   10:
     name: "L'+D 640x360@60 interleave (SDK 30fps)"
+    usb: 3
     color: {w: 640, h: 360, fmt: 0, split_lr: false}
     depth: {w: 640, h: 360, dtype: 18}
     zd_index: 2
@@ -99,6 +126,7 @@ modes:
     interleave: true
   11:
     name: "L'+D 640x360@30 interleave (SDK 15fps)"
+    usb: 3
     color: {w: 640, h: 360, fmt: 0, split_lr: false}
     depth: {w: 640, h: 360, dtype: 18}
     zd_index: 2
@@ -106,6 +134,7 @@ modes:
     interleave: true
   12:
     name: "L'+D 640x360@20 interleave (SDK 10fps)"
+    usb: 3
     color: {w: 640, h: 360, fmt: 0, split_lr: false}
     depth: {w: 640, h: 360, dtype: 18}
     zd_index: 2
@@ -115,6 +144,7 @@ modes:
   # === L'+D 480x270 ===
   13:
     name: "L'+D 480x270@60 interleave (SDK 30fps)"
+    usb: 3
     color: {w: 480, h: 270, fmt: 0, split_lr: false}
     depth: {w: 480, h: 270, dtype: 18}
     zd_index: 3
@@ -122,6 +152,7 @@ modes:
     interleave: true
   14:
     name: "L'+D 480x270@30 interleave (SDK 15fps)"
+    usb: 3
     color: {w: 480, h: 270, fmt: 0, split_lr: false}
     depth: {w: 480, h: 270, dtype: 18}
     zd_index: 3
@@ -129,6 +160,7 @@ modes:
     interleave: true
   15:
     name: "L'+D 480x270@20 interleave (SDK 10fps)"
+    usb: 3
     color: {w: 480, h: 270, fmt: 0, split_lr: false}
     depth: {w: 480, h: 270, dtype: 18}
     zd_index: 3
@@ -138,6 +170,7 @@ modes:
   # === L'+D 424x240 ===
   16:
     name: "L'+D 424x240@60 interleave (SDK 30fps)"
+    usb: 3
     color: {w: 424, h: 240, fmt: 0, split_lr: false}
     depth: {w: 424, h: 240, dtype: 18}
     zd_index: 4
@@ -145,6 +178,7 @@ modes:
     interleave: true
   17:
     name: "L'+D 424x240@30 interleave (SDK 15fps)"
+    usb: 3
     color: {w: 424, h: 240, fmt: 0, split_lr: false}
     depth: {w: 424, h: 240, dtype: 18}
     zd_index: 4
@@ -152,6 +186,7 @@ modes:
     interleave: true
   18:
     name: "L'+D 424x240@20 interleave (SDK 10fps)"
+    usb: 3
     color: {w: 424, h: 240, fmt: 0, split_lr: false}
     depth: {w: 424, h: 240, dtype: 18}
     zd_index: 4
@@ -166,6 +201,7 @@ modes:
   # 1280x720 entry. dtype 50 marks the scaled-down depth variant.
   19:
     name: "L'+D 1280x720 color + 640x360 depth scale-down @60 interleave (SDK 30fps)"
+    usb: 3
     color: {w: 1280, h: 720, fmt: 0, split_lr: false}
     depth: {w:  640, h: 360, dtype: 50}
     zd_index: 0
@@ -173,6 +209,7 @@ modes:
     interleave: true
   20:
     name: "L'+D 1280x720 color + 640x360 depth scale-down @30 interleave (SDK 15fps)"
+    usb: 3
     color: {w: 1280, h: 720, fmt: 0, split_lr: false}
     depth: {w:  640, h: 360, dtype: 50}
     zd_index: 0
@@ -180,6 +217,7 @@ modes:
     interleave: true
   21:
     name: "L'+D 1280x720 color + 640x360 depth scale-down @20 interleave (SDK 10fps)"
+    usb: 3
     color: {w: 1280, h: 720, fmt: 0, split_lr: false}
     depth: {w:  640, h: 360, dtype: 50}
     zd_index: 0
@@ -189,6 +227,7 @@ modes:
   # === L'+R'+D wide ===
   22:
     name: "L'+R'+D 1280(x2)x720@10 + 720p depth"
+    usb: 3
     color: {w: 2560, h: 720, fmt: 0, split_lr: true}
     depth: {w: 1280, h: 720, dtype: 2}
     zd_index: 0
@@ -198,6 +237,7 @@ modes:
   # === L+R+D wide ===
   23:
     name: "L+R+D 1280(x2)x720@30 + 720p depth"
+    usb: 3
     color: {w: 2560, h: 720, fmt: 0, split_lr: true}
     depth: {w: 1280, h: 720, dtype: 7}
     zd_index: 0
@@ -205,6 +245,7 @@ modes:
     interleave: false
   24:
     name: "L+R+D 1280(x2)x720@10 + 720p depth"
+    usb: 3
     color: {w: 2560, h: 720, fmt: 0, split_lr: true}
     depth: {w: 1280, h: 720, dtype: 7}
     zd_index: 0
@@ -214,6 +255,7 @@ modes:
   # === D-only 1280x720 ===
   25:
     name: "D-only 1280x720@60"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 1280, h: 720, dtype: 2}
     zd_index: 0
@@ -221,6 +263,7 @@ modes:
     interleave: false
   26:
     name: "D-only 1280x720@30"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 1280, h: 720, dtype: 2}
     zd_index: 0
@@ -228,6 +271,7 @@ modes:
     interleave: false
   27:
     name: "D-only 1280x720@15"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 1280, h: 720, dtype: 2}
     zd_index: 0
@@ -235,6 +279,7 @@ modes:
     interleave: false
   28:
     name: "D-only 1280x720@10"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 1280, h: 720, dtype: 2}
     zd_index: 0
@@ -244,6 +289,7 @@ modes:
   # === D-only 640x480 ===
   29:
     name: "D-only 640x480@60"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 1
@@ -251,6 +297,7 @@ modes:
     interleave: false
   30:
     name: "D-only 640x480@30"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 1
@@ -258,6 +305,7 @@ modes:
     interleave: false
   31:
     name: "D-only 640x480@15"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 1
@@ -265,6 +313,7 @@ modes:
     interleave: false
   32:
     name: "D-only 640x480@10"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 1
@@ -274,6 +323,7 @@ modes:
   # === D-only 640x360 ===
   33:
     name: "D-only 640x360@30"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 360, dtype: 2}
     zd_index: 2
@@ -281,6 +331,7 @@ modes:
     interleave: false
   34:
     name: "D-only 640x360@15"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 360, dtype: 2}
     zd_index: 2
@@ -288,6 +339,7 @@ modes:
     interleave: false
   35:
     name: "D-only 640x360@10"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 360, dtype: 2}
     zd_index: 2
@@ -297,6 +349,7 @@ modes:
   # === D-only 480x270 ===
   36:
     name: "D-only 480x270@15"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 480, h: 270, dtype: 2}
     zd_index: 3
@@ -304,6 +357,7 @@ modes:
     interleave: false
   37:
     name: "D-only 480x270@10"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 480, h: 270, dtype: 2}
     zd_index: 3
@@ -313,6 +367,7 @@ modes:
   # === D-only 424x240 ===
   38:
     name: "D-only 424x240@15"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 424, h: 240, dtype: 2}
     zd_index: 4
@@ -320,6 +375,7 @@ modes:
     interleave: false
   39:
     name: "D-only 424x240@10"
+    usb: 3
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 424, h: 240, dtype: 2}
     zd_index: 4
@@ -329,6 +385,7 @@ modes:
   # === L'+R' wide 1280x720 ===
   40:
     name: "L'+R' 1280(x2)x720@60"
+    usb: 3
     color: {w: 2560, h: 720, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 0
@@ -336,6 +393,7 @@ modes:
     interleave: false
   41:
     name: "L'+R' 1280(x2)x720@30"
+    usb: 3
     color: {w: 2560, h: 720, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 0
@@ -343,6 +401,7 @@ modes:
     interleave: false
   42:
     name: "L'+R' 1280(x2)x720@15"
+    usb: 3
     color: {w: 2560, h: 720, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 0
@@ -350,6 +409,7 @@ modes:
     interleave: false
   43:
     name: "L'+R' 1280(x2)x720@10"
+    usb: 3
     color: {w: 2560, h: 720, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 0
@@ -359,6 +419,7 @@ modes:
   # === L'+R' wide 640x480 ===
   44:
     name: "L'+R' 640(x2)x480@60"
+    usb: 3
     color: {w: 1280, h: 480, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 1
@@ -366,6 +427,7 @@ modes:
     interleave: false
   45:
     name: "L'+R' 640(x2)x480@30"
+    usb: 3
     color: {w: 1280, h: 480, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 1
@@ -373,6 +435,7 @@ modes:
     interleave: false
   46:
     name: "L'+R' 640(x2)x480@15"
+    usb: 3
     color: {w: 1280, h: 480, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 1
@@ -380,6 +443,7 @@ modes:
     interleave: false
   47:
     name: "L'+R' 640(x2)x480@10"
+    usb: 3
     color: {w: 1280, h: 480, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 1
@@ -389,6 +453,7 @@ modes:
   # === L'+R' wide 640x360 ===
   48:
     name: "L'+R' 640(x2)x360@30"
+    usb: 3
     color: {w: 1280, h: 360, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 2
@@ -396,6 +461,7 @@ modes:
     interleave: false
   49:
     name: "L'+R' 640(x2)x360@15"
+    usb: 3
     color: {w: 1280, h: 360, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 2
@@ -403,6 +469,7 @@ modes:
     interleave: false
   50:
     name: "L'+R' 640(x2)x360@10"
+    usb: 3
     color: {w: 1280, h: 360, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 2
@@ -412,6 +479,7 @@ modes:
   # === L'+R' wide 480x270 / 424x240 ===
   51:
     name: "L'+R' 480(x2)x270@15"
+    usb: 3
     color: {w: 960, h: 270, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 3
@@ -419,20 +487,23 @@ modes:
     interleave: false
   52:
     name: "L'+R' 480(x2)x270@10"
+    usb: 3
     color: {w: 960, h: 270, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 3
     fps: 10
     interleave: false
   53:
-    name: "L'+R' 424x240@15"
+    name: "L'+R' 424(x2)x240@15"
+    usb: 3
     color: {w: 848, h: 240, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 4
     fps: 15
     interleave: false
   54:
-    name: "L'+R' 424x240@10"
+    name: "L'+R' 424(x2)x240@10"
+    usb: 3
     color: {w: 848, h: 240, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 4
@@ -442,6 +513,7 @@ modes:
   # === USB 2.0 L'+D ===
   55:
     name: "L'+D 1280x720@10 (USB 2.0)"
+    usb: 2
     color: {w: 1280, h: 720, fmt: 1, split_lr: false}
     depth: {w: 1280, h: 720, dtype: 2}
     zd_index: 0
@@ -449,6 +521,7 @@ modes:
     interleave: false
   56:
     name: "L'+D 1280x720@24 + 640x360 depth interleave (USB 2.0, SDK 12fps)"
+    usb: 2
     color: {w: 1280, h: 720, fmt: 1, split_lr: false}
     depth: {w:  640, h: 360, dtype: 50}
     zd_index: 0
@@ -456,6 +529,7 @@ modes:
     interleave: true
   57:
     name: "L'+D 1280x720@20 + 640x360 depth interleave (USB 2.0, SDK 10fps)"
+    usb: 2
     color: {w: 1280, h: 720, fmt: 1, split_lr: false}
     depth: {w:  640, h: 360, dtype: 50}
     zd_index: 0
@@ -463,6 +537,7 @@ modes:
     interleave: true
   58:
     name: "L'+D 640x480@24 (USB 2.0)"
+    usb: 2
     color: {w: 640, h: 480, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 1
@@ -470,6 +545,7 @@ modes:
     interleave: false
   59:
     name: "L'+D 640x480@15 (USB 2.0)"
+    usb: 2
     color: {w: 640, h: 480, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 1
@@ -477,6 +553,7 @@ modes:
     interleave: false
   60:
     name: "L'+D 640x480@10 (USB 2.0)"
+    usb: 2
     color: {w: 640, h: 480, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 1
@@ -484,6 +561,7 @@ modes:
     interleave: false
   61:
     name: "L'+D 640x360@24 (USB 2.0)"
+    usb: 2
     color: {w: 640, h: 360, fmt: 1, split_lr: false}
     depth: {w: 640, h: 360, dtype: 2}
     zd_index: 2
@@ -491,6 +569,7 @@ modes:
     interleave: false
   62:
     name: "L'+D 640x360@15 (USB 2.0)"
+    usb: 2
     color: {w: 640, h: 360, fmt: 1, split_lr: false}
     depth: {w: 640, h: 360, dtype: 2}
     zd_index: 2
@@ -498,6 +577,7 @@ modes:
     interleave: false
   63:
     name: "L'+D 640x360@10 (USB 2.0)"
+    usb: 2
     color: {w: 640, h: 360, fmt: 1, split_lr: false}
     depth: {w: 640, h: 360, dtype: 2}
     zd_index: 2
@@ -507,6 +587,7 @@ modes:
   # === USB 2.0 D-only ===
   64:
     name: "D-only 1280x720@10 (USB 2.0)"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 1280, h: 720, dtype: 2}
     zd_index: 0
@@ -514,6 +595,7 @@ modes:
     interleave: false
   65:
     name: "D-only 640x480@24 (USB 2.0)"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 1
@@ -521,6 +603,7 @@ modes:
     interleave: false
   66:
     name: "D-only 640x480@15 (USB 2.0)"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 1
@@ -528,6 +611,7 @@ modes:
     interleave: false
   67:
     name: "D-only 640x480@10 (USB 2.0)"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 480, dtype: 2}
     zd_index: 1
@@ -535,6 +619,7 @@ modes:
     interleave: false
   68:
     name: "D-only 640x360@24 (USB 2.0)"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 360, dtype: 2}
     zd_index: 2
@@ -542,6 +627,7 @@ modes:
     interleave: false
   69:
     name: "D-only 640x360@15 (USB 2.0)"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 360, dtype: 2}
     zd_index: 2
@@ -549,6 +635,7 @@ modes:
     interleave: false
   70:
     name: "D-only 640x360@10 (USB 2.0)"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 640, h: 360, dtype: 2}
     zd_index: 2
@@ -556,6 +643,7 @@ modes:
     interleave: false
   71:
     name: "D-only 480x270@15 (USB 2.0)"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 480, h: 270, dtype: 2}
     zd_index: 3
@@ -563,6 +651,7 @@ modes:
     interleave: false
   72:
     name: "D-only 480x270@10 (USB 2.0)"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 480, h: 270, dtype: 2}
     zd_index: 3
@@ -570,6 +659,7 @@ modes:
     interleave: false
   73:
     name: "D-only 424x240@15 (USB 2.0)"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 424, h: 240, dtype: 2}
     zd_index: 4
@@ -577,6 +667,7 @@ modes:
     interleave: false
   74:
     name: "D-only 424x240@10 (USB 2.0)"
+    usb: 2
     color: {w: 0, h: 0, fmt: 1, split_lr: false}
     depth: {w: 424, h: 240, dtype: 2}
     zd_index: 4
@@ -586,6 +677,7 @@ modes:
   # === USB 2.0 L'+R' wide ===
   75:
     name: "L'+R' 1280(x2)x720@2 (USB 2.0)"
+    usb: 2
     color: {w: 2560, h: 720, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 0
@@ -593,6 +685,7 @@ modes:
     interleave: false
   76:
     name: "L'+R' 640(x2)x480@5 (USB 2.0)"
+    usb: 2
     color: {w: 1280, h: 480, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 1
@@ -600,6 +693,7 @@ modes:
     interleave: false
   77:
     name: "L'+R' 640(x2)x360@10 (USB 2.0)"
+    usb: 2
     color: {w: 1280, h: 360, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 2
@@ -607,6 +701,7 @@ modes:
     interleave: false
   78:
     name: "L'+R' 480(x2)x270@10 (USB 2.0)"
+    usb: 2
     color: {w: 960, h: 270, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 3
@@ -614,6 +709,7 @@ modes:
     interleave: false
   79:
     name: "L'+R' 424(x2)x240@10 (USB 2.0)"
+    usb: 2
     color: {w: 848, h: 240, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 5}
     zd_index: 4
@@ -623,6 +719,7 @@ modes:
   # === L+R wide ===
   80:
     name: "L+R 1280(x2)x720@30"
+    usb: 3
     color: {w: 2560, h: 720, fmt: 0, split_lr: true}
     depth: {w: 0, h: 0, dtype: 0}
     zd_index: 0

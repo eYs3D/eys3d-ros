@@ -6,9 +6,12 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "eys3d_camera/selfcal_manager.hpp"
 
 namespace eys3d_camera {
 
@@ -22,6 +25,9 @@ struct DeviceConfig {
     // when multiple cameras are connected the matching PID wins over
     // index-0 fallback.
     std::string model;
+    // USB port type this mode needs (2 = USB2.0, 3 = USB3.0; 0 = unspecified).
+    // Opening the device is refused when it differs from the negotiated link.
+    int mode_usb = 0;
     int color_width = 1280;
     int color_height = 720;
     int color_format = 0;        // 0 = YUYV, 1 = MJPEG
@@ -42,13 +48,22 @@ struct DeviceConfig {
     // Ignored for MJPEG modes — those still decode to a single wide
     // buffer that camera_node slices downstream.
     bool split_color = false;
-    // PointCloud Z clip range in mm. -1 on either side uses the per-model
-    // default (resolved at open from depth_range_for_pid).
-    int depth_minimum_mm = -1;
-    int depth_maximum_mm = -1;
+    // Per-model constants from the video-mode catalogue header
+    // (launch/video_modes/<MODEL>.yaml). The code layer keeps no
+    // per-model tables; adding a camera means adding a YAML file.
+    unsigned short expected_pid = 0;  // 0 = skip the open-time PID check
+    bool mono = false;                // monochrome sensor pair (color is luma)
+    int ir_default = 0;               // projector level for ir_value = -1
+    int default_near_mm = 0;          // catalogue working range, used when
+    int default_far_mm = 0;           // the matching depth_*_mm is -1
+
+    // Working range in mm applied to the depth raster and the point
+    // cloud. -1 on either side falls back to the catalogue default.
+    int depth_near_mm = -1;
+    int depth_far_mm = -1;
     // IR projector intensity applied before APC_OpenDevice2.
-    // -1 = per-PID default; ≥0 = explicit value, clamped by FW IR-MAX.
-    int ir_intensity = -1;
+    // -1 = catalogue default; ≥0 = explicit value, clamped by FW IR-MAX.
+    int ir_value = -1;
 
     // Disparity-domain spatial filter. When enabled, the depth stream
     // opens in 11-bit disparity mode (depth_data_type + 2); the
@@ -80,7 +95,7 @@ struct DeviceConfig {
     // directly otherwise. Launch-time only.
     //   0 = off
     //   1 = fill_from_left
-    //   2 = farthest_from_around (recommended starting mode)
+    //   2 = farthest_from_around
     //   3 = nearest_from_around
     int    hole_filling = 0;
 
@@ -92,12 +107,18 @@ struct DeviceConfig {
     // the first detected device is used.
     std::string serial_number;
     // Optional substring match against the USB topology path of the V4L2
-    // device (for example, "2-3:1.0" = bus 2, port 3, config 1, interface 0).
-    // The path is stable across reboots and plug order, making it the
-    // preferred way to pin a camera to a fixed physical port in production
-    // deployments. Resolved via /sys/class/video4linux/videoN/device.
-    // Ignored when serial_number already matches.
+    // device (for example, "2-3:1.0" = bus 2, port 3, config 1, interface 0),
+    // resolved via /sys/class/video4linux/videoN/device. Stable across reboots
+    // and plug order. When both serial_number and usb_port are set, both must
+    // match.
     std::string usb_port;
+
+    // Self-calibration (selfk). Off by default. When true (and the feature is
+    // built in), open() binds a SelfCalManager to the device handle so an
+    // in-stream calibration session can be started later. selfcal_config_dir
+    // holds the JSON tuning profiles loaded by start_selfcal().
+    bool        selfcal_enable = false;
+    std::string selfcal_config_dir;
 };
 
 // Frame payload moved (not copied) from the SDK fetch thread into the
@@ -113,7 +134,7 @@ struct DeviceConfig {
 struct FrameBuffer {
     std::vector<uint8_t> data;
     std::vector<uint8_t> data_right;
-    int serial_number = 0;
+    int frame_number = 0;
     uint64_t hw_timestamp_us = 0;
     int width = 0;
     int height = 0;
@@ -121,13 +142,10 @@ struct FrameBuffer {
 
 using ColorFrameCb = std::function<void(FrameBuffer&&)>;
 using DepthFrameCb = std::function<void(FrameBuffer&&)>;
-// Point-cloud callback. The point-cloud thread hands the consumer an
-// owning byte buffer sized to `valid_points * point_step`, with
-// `point_step` set to 12 for the XYZ-only layout (X, Y, Z float32) or
-// 16 for the XYZRGB layout (the same three coordinates followed by a
-// uint32 RGB packed as 0x00RRGGBB). Buffer ownership is transferred
-// via std::move; the consumer typically moves it again into
-// sensor_msgs::msg::PointCloud2::data with no further copy.
+// Point-cloud callback. The buffer is `valid_points * point_step` bytes and
+// its ownership transfers to the consumer. point_step is 12 for the XYZ-only
+// layout (X, Y, Z float32) or 16 for XYZRGB (those three followed by a uint32
+// RGB packed as 0x00RRGGBB).
 using PointCloudCb = std::function<void(
     std::vector<uint8_t>&& xyz_bytes,
     uint32_t valid_points,
@@ -158,6 +176,13 @@ public:
     bool open(const DeviceConfig& cfg);
     void close();
 
+    // Selects the device the given hints would open (serial / usb_port / PID
+    // precedence, mirroring open()) and returns its negotiated USB link type
+    // (2 = USB2.0, 3 = USB3.0), or nullopt if selection/query fails. Used to
+    // resolve the signature default mode before the full open. Does not leave
+    // a device open.
+    std::optional<int> probe_usb_type(const DeviceConfig& cfg);
+
     void start(ColorFrameCb on_color, DepthFrameCb on_depth, PointCloudCb on_pc);
     void stop();
 
@@ -175,19 +200,29 @@ public:
     // follow sensor_msgs/CameraInfo row-major convention.
     struct LensCalibration {
         std::array<double, 9>  K{};            // 3x3 raw camera matrix (CamMat*)
-        std::array<double, 5>  D{};            // plumb_bob: k1, k2, p1, p2, k3 (CamDist*)
+        std::array<double, 8>  D{};            // rational_polynomial: k1, k2, p1, p2, k3, k4, k5, k6 (CamDist*)
         std::array<double, 9>  R{};            // 3x3 rectification rotation (*RotaMat)
         std::array<double, 12> P{};            // 3x4 projection rectified (NewCamMat*)
     };
     struct Calibration {
-        int width = 0;
-        int height = 0;
+        // Height, not width: side-by-side doubles the log's width, never its
+        // height. K and D are at in_height, P at out_height.
+        int in_height  = 0;                     // InImgHeight
+        int out_height = 0;                     // OutImgHeight
         LensCalibration left;                   // CamMat1 / CamDist1 / LRotaMat / NewCamMat1
         LensCalibration right;                  // CamMat2 / CamDist2 / RRotaMat / NewCamMat2
         double baseline_mm = 0;                 // |TranMat[0]| from rect log
         bool valid = false;
     };
     Calibration calibration() const;
+
+    // Scales a matrix from the raster it is stored at to the published one.
+    // /depth/camera_info and the point-cloud reprojection must agree here.
+    static double raster_scale(int raster_height, int published_height) {
+        return (raster_height > 0 && published_height > 0)
+            ? static_cast<double>(published_height) / raster_height
+            : 1.0;
+    }
 
     // Applies per-chip register tuning from
     // <cfg_dir>/<model>_DM_Quality_Register_Setting.cfg in a detached worker.
@@ -200,25 +235,17 @@ public:
     // when the device is closed or the SDK call fails; failures are logged
     // through rclcpp at the warn level.
     //
-    // set_ir_intensity:
+    // set_ir_value:
     //   value > 0  → enable projector and set raw level (clamped to ir_max)
     //   value == 0 → disable projector
     //   value < 0  → use the per-PID default
-    bool set_ir_intensity(int value);
+    bool set_ir_value(int value);
 
-    // Runtime control for the temporal filter. Safe to call from any
-    // thread while the pipeline is streaming; the new settings take
-    // effect on the next depth frame. A disabled-to-enabled
-    // transition clears the per-pixel persistence history. The filter
-    // runs on D11 disparity when chained after the spatial IIR and on
-    // the Z14 mm raster otherwise; `delta` is interpreted in the
-    // active domain unit.
-    //
-    // Argument ranges:
-    //   alpha          0.0 .. 1.0
-    //   delta          raw disparity units when spatial_filter is on,
-    //                  mm otherwise (≥ 1)
-    //   persistence    0 .. 8 (see TemporalFilterParams in temporal_filter.hpp)
+    // Thread-safe; takes effect on the next depth frame. Enabling clears the
+    // per-pixel persistence history.
+    //   alpha        0.0 .. 1.0
+    //   delta        >= 1; raw disparity units with spatial_filter on, mm off
+    //   persistence  0 .. 8 (TemporalFilterParams in temporal_filter.hpp)
     bool set_temporal_filter(bool enabled, double alpha,
                              int delta, int persistence);
 
@@ -244,7 +271,7 @@ public:
     // ROS param defaults from the camera's boot configuration so the
     // operator's pre-configured values are preserved across node restarts.
     struct RuntimeState {
-        int  ir_intensity         = -1;   // -1 = read failed
+        int  ir_value         = -1;   // -1 = read failed
         bool ir_read_ok           = false;
         bool auto_exposure        = true;
         bool auto_exposure_read_ok = false;
@@ -257,63 +284,45 @@ public:
     };
     RuntimeState read_runtime_state() const;
 
-    // Runtime stream control. There are two distinct cost / latency tiers
-    // here, exposed as separate methods rather than a single SetBool:
+    //   Active   fetch threads running, frames decoded and published.
+    //   Paused   USB still drained, every frame dropped before decode.
+    //   Standby  APC_CloseDevice releases the V4L2 fd; fetch threads joined.
+    //            The SDK handle, calibration and ZD table are kept.
     //
-    //   Active   — normal streaming. SDK fetch threads running, frames
-    //              decoded and published.
-    //   Paused   — SDK + USB still active, fetch threads still drain the
-    //              USB buffer, but every frame is dropped at the top of
-    //              the iteration before decode / filter / publish. Almost
-    //              zero CPU; resumes on the next frame (~33 ms @ 30 fps).
-    //   Standby  — APC_CloseDevice releases the V4L2 fd. No USB traffic,
-    //              fetch threads joined, but the SDK handle (and the
-    //              cached calibration / ZD table) is kept so the next
-    //              standby(false) restarts in ~200-400 ms without redoing
-    //              APC_Init / GetRectifyMatLogData.
-    //
-    // Both controls toggle the colour + depth pair together — per-stream
-    // toggling is not supported because interleave modes (G100+ mode 1)
-    // require both halves of the stream to be active and the use cases
-    // never call for splitting them.
+    // Both controls move the colour + depth pair together: interleave modes
+    // need both halves of the stream active.
     enum class StreamState : uint8_t { Active = 0, Paused = 1, Standby = 2 };
 
-    // pause(true)  :: Active -> Paused  (no SDK work; resume next frame)
-    // pause(false) :: Paused -> Active
-    // Calling pause() while Standby is active records the desired
-    // post-standby state; the actual transition happens when the next
-    // standby(false) succeeds. pause() shares lifecycle_mtx with
-    // standby() so the two cannot race; the lock is sub-microsecond
-    // uncontended.
-    // Returns true on success or when the requested state already
-    // matches; never returns false in the current implementation.
+    // Called while Standby, it records the desired post-standby state; the
+    // transition happens on the next standby(false). Shares lifecycle_mtx with
+    // standby(). True on success or when the state already matches.
     bool pause(bool on);
 
     // standby(true)  :: stops fetch threads + APC_CloseDevice.
     // standby(false) :: APC_OpenDevice2 + spawn fetch threads, lands in
     //                   Active (or Paused if pause() was called while
     //                   Standby was in effect).
-    // Returns true on success or when the requested state already
-    // matches. Returns false only if standby(false)'s reopen fails — in
-    // that case the device is left closed and the node should be
-    // restarted.
+    // True on success or when the state already matches. False with the
+    // device not open, either direction, and while a self-calibration session
+    // holds it. A failed reopen leaves it closed for the reconnect loop.
     bool standby(bool on);
 
     StreamState stream_state() const;
 
-    // Atomic per-stream counters maintained by the fetch + pc threads. Read
-    // any time from any thread; consumers (CameraNode's diagnostics timer)
-    // compute fps by diffing across a fixed wall window.
-    //
-    // Two distinct rates are maintained per stream:
-    //   - *_input_total   : count of frames received from the SDK
-    //                       (always increments while the camera streams).
-    //   - *_publish_total : count of frames actually emitted through the
-    //                       publish callback (gated by subscriber state).
-    //
-    // input - publish reveals "subscribers present but driver behind",
-    // while publish = 0 with input > 0 simply means nobody is listening
-    // and the gate is suppressing the decode + dispatch work.
+    // Firmware USB self-reset: writes the eSP876 register sequence whose tail
+    // write drops the USB link, so the host re-enumerates the device. Issuable
+    // while Streaming, Paused or in Standby. The detach-triggering writes are
+    // acknowledged unreliably, so individual register results are ignored.
+    // False only when the device is not open.
+    bool reset_usb();
+
+    // Atomic per-stream counters maintained by the fetch + pc threads,
+    // readable from any thread; fps comes from diffing them across a fixed
+    // wall window.
+    //   *_input_total    frames received from the SDK; always increments
+    //                    while the camera streams.
+    //   *_publish_total  frames emitted through the publish callback, gated
+    //                    by subscriber state.
     struct Stats {
         // Per-stream input rates (SDK → driver).
         uint64_t color_input_total    = 0;
@@ -330,7 +339,7 @@ public:
         uint64_t color_decode_sum_us  = 0;
         uint64_t color_decode_max_us  = 0;
         // Point-cloud reprojection timing (computed only when there is a
-        // /pointcloud subscriber). pc_publish_total == pc_compute_count.
+        // /depth/points subscriber). pc_publish_total == pc_compute_count.
         uint64_t pc_publish_total     = 0;
         uint64_t pc_compute_sum_us    = 0;   // for avg = sum / count
         uint64_t pc_compute_max_us    = 0;
@@ -348,6 +357,32 @@ public:
     std::string usb_port() const;
     int actual_fps() const;
 
+    // --- Self-calibration (selfk) ---------------------------------------
+    // Bound only when DeviceConfig::selfcal_enable was set and open() succeeded
+    // in creating a selfk context on the device handle. Every method is a safe
+    // no-op otherwise (selfcal_available() returns false).
+
+    // True once a selfk context is bound to the open device.
+    bool selfcal_available() const;
+    // True while a session is running; callers use it to decline stream-control
+    // actions (pause / standby / hw_reset) that would interrupt the session.
+    bool selfcal_active() const;
+    // Load <selfcal_config_dir>/<profile>.json and start an in-stream session.
+    // The device must already be streaming a depth mode. Returns false on error
+    // or when a session is already running.
+    bool start_selfcal(const std::string& profile);
+    // Stop the running session; the SDK restores the last stable probe value.
+    bool stop_selfcal();
+    // End the session and roll cy back to the snapshot taken at start (used when
+    // the result is worse / not wanted).
+    bool revert_selfcal();
+    // End the session, keeping the converged value live (not committed).
+    void keep_selfcal();
+    // Commit the converged result to the G2 flash bank.
+    bool commit_selfcal();
+    // Snapshot of the current session state, for the diagnostics surface.
+    SelfCalManager::Status selfcal_status() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -357,6 +392,29 @@ private:
     // the Paused state is handled by gating at the top of each iteration
     // rather than skipping the spawn.
     void spawn_fetch_threads_();
+
+    // Guard for the set_*_gate() setters: the gates are lock-free reads on the
+    // fetch threads, so they may only be assigned while stopped. Returns false
+    // (and logs) if called while streaming. `which` names the caller for the
+    // log line.
+    bool gate_setter_allowed(const char* which);
+
+    // Snapshot / restore the cy_R register around a self-calibration session so
+    // a worse or abandoned run can be rolled back.
+    bool snapshot_cy();
+    bool restore_cy();
+
+    // Read / write the two cy_R register bytes (both take sdk_mtx). Exposed to
+    // the SelfCalManager A/B re-check via callbacks so it can toggle between the
+    // converged and pre-session cy on the live stream.
+    bool get_cy_regs(unsigned short& lo, unsigned short& hi);
+    bool set_cy_regs(unsigned short lo, unsigned short hi);
+
+    // Returns true (and logs) when a self-calibration session currently owns
+    // the control channel, so a control-register setter must decline rather
+    // than race the selfk worker's per-frame register writes. `which` names the
+    // caller for the log line.
+    bool selfcal_reject(const char* which);
 };
 
 }  // namespace eys3d_camera

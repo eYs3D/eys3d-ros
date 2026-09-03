@@ -15,20 +15,12 @@ namespace eys3d_camera {
 // frame has been received; firmware writes before that point are
 // discarded.
 //
-// Parameters:
-//   sdk_handle   Active eSPDI SDK handle.
-//   dev_index    Index of the target device within the SDK enumeration.
-//   pid          USB PID of the camera (selects the matching cfg file).
-//   cfg_dir      Directory containing the *_DM_Quality_Register_Setting.cfg
-//                files.
-//   sdk_mtx      Mutex held by the caller for the full duration of each
-//                register read-modify-write so that concurrent UVC control
-//                traffic (image controls, temperature reads) cannot
-//                interleave with this loop and corrupt the FW control
-//                channel.
+// The caller holds sdk_mtx for the whole read-modify-write of each register:
+// concurrent UVC control traffic (image controls, temperature reads) would
+// otherwise interleave with this loop and corrupt the FW control channel.
 //
-// Returns the number of registers successfully programmed, or a negative
-// APC_* error code on a fatal failure (config file missing or unparsable).
+// Returns the number of registers programmed, or a negative APC_* error code
+// if the config file is missing or unparsable.
 int apply_dm_quality_register_setting(
     void* sdk_handle,
     int dev_index,

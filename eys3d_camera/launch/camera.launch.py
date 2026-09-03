@@ -32,6 +32,7 @@ Filter tuning split:
 """
 
 import os
+import tempfile
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -39,16 +40,17 @@ from launch.actions import (DeclareLaunchArgument, OpaqueFunction,
                             RegisterEventHandler)
 from launch.conditions import IfCondition, LaunchConfigurationEquals
 from launch.event_handlers import OnProcessIO
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import Command, LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
     args = [
         DeclareLaunchArgument('model', default_value='G100P',
-                              description='Camera model. Catalogue file: launch/video_modes/<model>.yaml.'),
-        DeclareLaunchArgument('mode_id', default_value='1',
-                              description='Mode index inside the catalogue.'),
+                              description='Camera model. Catalog file: launch/video_modes/<model>.yaml.'),
+        DeclareLaunchArgument('mode_id', default_value='-1',
+                              description='Mode index inside the catalog; -1 = auto (signature default for the negotiated USB link).'),
         DeclareLaunchArgument('camera_name', default_value='camera',
                               description='ROS namespace and frame-id prefix for this camera.'),
         DeclareLaunchArgument('dev_serial_number', default_value='',
@@ -56,12 +58,14 @@ def generate_launch_description():
         DeclareLaunchArgument('usb_port', default_value='',
                               description='Bind to a specific camera by USB topology path '
                                           '(e.g. "2-3:1.0"). Stable across reboots.'),
-        DeclareLaunchArgument('depth_minimum_mm', default_value='-1',
-                              description='PointCloud2 near clip in millimetres. '
-                                          '-1 = default; positive integer to override.'),
-        DeclareLaunchArgument('depth_maximum_mm', default_value='-1',
-                              description='PointCloud2 far clip in millimetres. '
-                                          '-1 = default; positive integer to override.'),
+        DeclareLaunchArgument('depth_near_mm', default_value='-1',
+                              description='Depth-image + PointCloud2 near clip in millimeters; '
+                                          'pixels nearer than this are set to 0 (no-data). '
+                                          '-1 = per-model default; positive integer to override.'),
+        DeclareLaunchArgument('depth_far_mm', default_value='-1',
+                              description='Depth-image + PointCloud2 far clip in millimeters; '
+                                          'pixels beyond this are set to 0 (no-data). '
+                                          '-1 = per-model default; positive integer to override.'),
         DeclareLaunchArgument('colored_pointcloud', default_value='false',
                               description='Publish XYZRGB PointCloud2 (point_step=16) by sampling '
                                           'the latest decoded left-color frame at each valid '
@@ -87,17 +91,28 @@ def generate_launch_description():
                                           'via `ros2 param set`.'),
         DeclareLaunchArgument('diagnostics_rate_hz', default_value='1.0',
                               description='Publish rate for /diagnostics (0 = disabled).'),
-        DeclareLaunchArgument('ir_intensity', default_value='-1',
+        DeclareLaunchArgument('ir_value', default_value='-1',
                               description='IR projector level. '
                                           '-1 = per-PID default (G100+/R77 = 3, G62 = 60); '
                                           '0 = projector off; '
                                           'positive integer = raw level (clamped to FW max).'),
+        DeclareLaunchArgument('selfcal_enable', default_value='false',
+                              description='Enable in-stream self-calibration. '
+                                          'Exposes the /<cam>/selfcal/run action and '
+                                          '/<cam>/selfcal/commit service.'),
         DeclareLaunchArgument('log', default_value='all',
                               description='Terminal output level. '
                                           'all = full RCLCPP + SDK output (default); '
                                           'sdk = suppress RCLCPP, keep SDK printf; '
                                           'close = redirect everything to a per-process '
                                           'log file (terminal silent).'),
+        DeclareLaunchArgument('urdf', default_value='true',
+                              description='Publish the camera model on '
+                                          '<camera_name>/robot_description via '
+                                          'robot_state_publisher. Set false when the '
+                                          'robot bringup already carries the camera '
+                                          'in its own description (e.g. multi-camera '
+                                          'rigs).'),
         DeclareLaunchArgument('rviz', default_value='false',
                               description='Open the bundled RViz layout on launch. '
                                           'Default false here; the per-model launches default to true.'),
@@ -132,15 +147,16 @@ def generate_launch_description():
             'mode_id':             LaunchConfiguration('mode_id'),
             'dev_serial_number':   LaunchConfiguration('dev_serial_number'),
             'usb_port':            LaunchConfiguration('usb_port'),
-            'depth_minimum_mm':    LaunchConfiguration('depth_minimum_mm'),
-            'depth_maximum_mm':    LaunchConfiguration('depth_maximum_mm'),
+            'depth_near_mm':       LaunchConfiguration('depth_near_mm'),
+            'depth_far_mm':        LaunchConfiguration('depth_far_mm'),
             'colored_pointcloud':  LaunchConfiguration('colored_pointcloud'),
             'spatial_filter':      LaunchConfiguration('spatial_filter'),
             'temporal_filter':     LaunchConfiguration('temporal_filter'),
             'hole_filling':        LaunchConfiguration('hole_filling'),
             'diagnostics_rate_hz': LaunchConfiguration('diagnostics_rate_hz'),
             'dm_quality_cfg_dir':  dm_quality_cfg_dir,
-            'ir_intensity':        LaunchConfiguration('ir_intensity'),
+            'ir_value':            LaunchConfiguration('ir_value'),
+            'selfcal_enable':      LaunchConfiguration('selfcal_enable'),
         }
 
         # Three Node variants below; exactly one runs, selected by the
@@ -191,6 +207,25 @@ def generate_launch_description():
             **common_kwargs,
         )
 
+        # Camera model publisher. Namespaced so a multi-camera setup or a
+        # robot with its own /robot_description is never clobbered; the
+        # shipped rviz layouts subscribe to the namespaced topic.
+        urdf_xacro = os.path.join(pkg_share, 'urdf', 'eys3d_camera.urdf.xacro')
+        rsp_node = Node(
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            namespace=LaunchConfiguration('camera_name'),
+            output='log',
+            condition=IfCondition(LaunchConfiguration('urdf')),
+            parameters=[{
+                'robot_description': ParameterValue(Command([
+                    'xacro ', urdf_xacro,
+                    ' model:=', LaunchConfiguration('model'),
+                    ' camera_name:=', LaunchConfiguration('camera_name'),
+                ]), value_type=str),
+            }],
+        )
+
         # rviz2 is held back until camera_node prints "EYS3D_CAMERA_READY"
         # on stdout (emitted at the first depth frame) to avoid a known
         # startup race on Foxy.
@@ -199,6 +234,20 @@ def generate_launch_description():
             model = LaunchConfiguration('model').perform(context)
             rviz_cfg = os.path.join(pkg_share, 'rviz',
                                     f'eys3d_camera_{model}.rviz')
+            # The shipped layout addresses the default camera name (<model>_1)
+            # in every topic path and TF frame id, so a renamed camera gets the
+            # layout rewritten with its actual name.
+            camera_name = LaunchConfiguration('camera_name').perform(context)
+            default_name = f'{model}_1'
+            if camera_name != default_name and os.path.exists(rviz_cfg):
+                with open(rviz_cfg) as f:
+                    layout = f.read().replace(default_name, camera_name)
+                # One deterministic path per camera name, rewritten each launch.
+                rviz_cfg = os.path.join(
+                    tempfile.gettempdir(),
+                    f'eys3d_camera_{camera_name}.rviz')
+                with open(rviz_cfg, 'w') as f:
+                    f.write(layout)
         rviz_node = Node(
             package='rviz2', executable='rviz2', name='rviz2',
             output='log',
@@ -227,6 +276,6 @@ def generate_launch_description():
         ]
 
         return [camera_node_all, camera_node_sdk, camera_node_close,
-                *rviz_handlers]
+                rsp_node, *rviz_handlers]
 
     return LaunchDescription(args + [OpaqueFunction(function=_setup)])

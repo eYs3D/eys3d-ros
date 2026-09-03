@@ -104,9 +104,19 @@ int apply_dm_quality_register_setting(
         std::lock_guard<std::mutex> lk(sdk_mtx);
 
         unsigned short existing = 0;
-        APC_GetHWRegister(sdk_handle, &sel,
+        const int rd_rc = APC_GetHWRegister(sdk_handle, &sel,
                           static_cast<unsigned short>(addr),
                           &existing, rmw_flags);
+        if (rd_rc != APC_OK) {
+            // A failed read leaves `existing` = 0. Proceeding would zero every
+            // bit outside `mask` that this read-modify-write is meant to
+            // preserve, write that wrong value, and then "verify" against it.
+            // Skip the line instead of corrupting the register.
+            RCLCPP_WARN(rclcpp::get_logger(logger()),
+                        "reg 0x%04x: read failed (rc=%d); skipping line", addr, rd_rc);
+            ++lines_failed;
+            continue;
+        }
 
         const unsigned short not_mask = static_cast<unsigned short>(~mask);
         const unsigned short target =

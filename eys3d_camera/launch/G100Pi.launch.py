@@ -7,8 +7,9 @@ Equivalent to:
 The common camera.launch.py arguments are forwarded; `diagnostics_rate_hz`
 is available only on `camera.launch.py`.
 
-The default mode (mode_id=1) is L'+D 1280x720 interleave (SDK 30 fps per
-stream). G100+i exposes only the 1280x720 resolution group; refer to
+mode_id defaults to -1 (auto): the driver probes the negotiated USB link and
+opens that model's signature default mode for it (USB3 -> 1280x720 interleave).
+G100+i exposes only the 1280x720 resolution group; refer to
 launch/video_modes/G100Pi.yaml for the available modes.
 
 Filter tuning is loaded from `cfg/filter_profiles/<filter_profile>.yaml`;
@@ -27,26 +28,31 @@ from launch.substitutions import LaunchConfiguration
 def generate_launch_description():
     args = [
         # ── Identity / binding ──────────────────────────────────────
-        DeclareLaunchArgument('mode_id',           default_value='1',
-                              description='Mode index from launch/video_modes/G100Pi.yaml.'),
+        DeclareLaunchArgument('mode_id',           default_value='-1',
+                              description='Mode index from launch/video_modes/G100Pi.yaml; -1 = auto (signature default for the negotiated USB link).'),
         DeclareLaunchArgument('camera_name',       default_value='G100Pi_1',
                               description='ROS namespace and frame-id prefix.'),
-        DeclareLaunchArgument('dev_serial_number', default_value=''),
-        DeclareLaunchArgument('usb_port',          default_value=''),
+        DeclareLaunchArgument('dev_serial_number', default_value='',
+                              description='Bind to a specific camera by serial-number substring.'),
+        DeclareLaunchArgument('usb_port',          default_value='',
+                              description='Bind to a specific camera by USB topology path (e.g. "2-3:1.0").'),
 
         # ── Hardware / range ────────────────────────────────────────
-        DeclareLaunchArgument('ir_intensity',      default_value='-1',
+        DeclareLaunchArgument('ir_value',          default_value='-1',
                               description='-1 = use default (3); 0 = off; '
-                                          'positive integer in FW range 0-9 to override.'),
-        DeclareLaunchArgument('depth_minimum_mm',  default_value='-1',
+                                          'positive integer in FW range 0-6 to override.'),
+        DeclareLaunchArgument('depth_near_mm',     default_value='-1',
                               description='-1 = use default (250 mm); positive integer to override.'),
-        DeclareLaunchArgument('depth_maximum_mm',  default_value='-1',
+        DeclareLaunchArgument('depth_far_mm',      default_value='-1',
                               description='-1 = use default (1900 mm); positive integer to override.'),
 
         # ── Post-processing enables ─────────────────────────────────
-        DeclareLaunchArgument('colored_pointcloud', default_value='false'),
-        DeclareLaunchArgument('spatial_filter',     default_value='false'),
-        DeclareLaunchArgument('temporal_filter',    default_value='false'),
+        DeclareLaunchArgument('colored_pointcloud', default_value='false',
+                              description='Publish XYZRGB PointCloud2 sampled from the latest colour frame.'),
+        DeclareLaunchArgument('spatial_filter',     default_value='false',
+                              description='Enable the spatial filter (4-direction edge-aware IIR).'),
+        DeclareLaunchArgument('temporal_filter',    default_value='false',
+                              description='Enable the temporal filter (alpha-blend + persistence).'),
         DeclareLaunchArgument('hole_filling',       default_value='0',
                               description='Hole filling mode. '
                                           '0=off; 1=fill_from_left; '
@@ -58,10 +64,16 @@ def generate_launch_description():
                                           'tuning values at startup.'),
 
         # Output / diagnostics
+        DeclareLaunchArgument('selfcal_enable', default_value='false',
+                              description='Enable in-stream self-calibration.'),
         DeclareLaunchArgument('log',  default_value='sdk',
                               description='Terminal output level: all / sdk(default) / close. '
                                           'See camera.launch.py for details.'),
-        DeclareLaunchArgument('rviz', default_value='true'),
+        DeclareLaunchArgument('urdf', default_value='true',
+                              description='Publish the camera model (URDF) via '
+                                          'robot_state_publisher. false = driver only.'),
+        DeclareLaunchArgument('rviz', default_value='true',
+                              description='Open the bundled RViz layout on launch.'),
     ]
 
     camera_launch = os.path.join(
@@ -76,15 +88,17 @@ def generate_launch_description():
             'camera_name':        LaunchConfiguration('camera_name'),
             'dev_serial_number':  LaunchConfiguration('dev_serial_number'),
             'usb_port':           LaunchConfiguration('usb_port'),
-            'ir_intensity':       LaunchConfiguration('ir_intensity'),
-            'depth_minimum_mm':   LaunchConfiguration('depth_minimum_mm'),
-            'depth_maximum_mm':   LaunchConfiguration('depth_maximum_mm'),
+            'ir_value':           LaunchConfiguration('ir_value'),
+            'depth_near_mm':      LaunchConfiguration('depth_near_mm'),
+            'depth_far_mm':       LaunchConfiguration('depth_far_mm'),
             'colored_pointcloud': LaunchConfiguration('colored_pointcloud'),
             'spatial_filter':     LaunchConfiguration('spatial_filter'),
             'temporal_filter':    LaunchConfiguration('temporal_filter'),
             'hole_filling':       LaunchConfiguration('hole_filling'),
             'filter_profile':     LaunchConfiguration('filter_profile'),
+            'selfcal_enable':     LaunchConfiguration('selfcal_enable'),
             'log':                LaunchConfiguration('log'),
+            'urdf':               LaunchConfiguration('urdf'),
             'rviz':               LaunchConfiguration('rviz'),
         }.items(),
     )

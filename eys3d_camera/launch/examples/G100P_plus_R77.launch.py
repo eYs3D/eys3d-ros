@@ -7,11 +7,11 @@ explicit usb_port. For production wiring, pin each instance to a
 specific USB socket via the usb_port argument so the same physical
 port always maps to the same camera_name across reboots.
 
-    ros2 launch eys3d_camera examples/G100P_plus_R77.launch.py
+    ros2 launch eys3d_camera G100P_plus_R77.launch.py
 
 Per-camera topics:
-    /G100P_1/{left_color, depth_image, pointcloud, ...}
-    /R77_1/{left_color, depth_image, pointcloud, ...}
+    /G100P_1/{left_color/image_raw, depth/image_raw, depth/points, ...}
+    /R77_1/{left_color/image_raw, depth/image_raw, depth/points, ...}
 """
 
 import os
@@ -22,7 +22,9 @@ from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 
 
-def _camera(model: str, camera_name: str, mode_id: str, usb_port: str = ''):
+def _camera(model: str, camera_name: str, mode_id: str, usb_port: str = '',
+            ir_value: str = '-1', depth_near_mm: str = '-1',
+            depth_far_mm: str = '-1', urdf: str = 'false'):
     return IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
             get_package_share_directory('eys3d_camera'),
@@ -32,6 +34,10 @@ def _camera(model: str, camera_name: str, mode_id: str, usb_port: str = ''):
             'mode_id':            mode_id,
             'camera_name':        camera_name,
             'usb_port':           usb_port,
+            'ir_value':           ir_value,
+            'depth_near_mm':      depth_near_mm,
+            'depth_far_mm':       depth_far_mm,
+            'urdf':               urdf,
             'rviz':               'false',
             'log':                'sdk',
         }.items(),
@@ -40,7 +46,7 @@ def _camera(model: str, camera_name: str, mode_id: str, usb_port: str = ''):
 
 def generate_launch_description():
     return LaunchDescription([
-        # G100+ at video mode 1 (1280x720 interleave, SDK 30 fps).
+        # G100+ at video mode 3 (1280x720 interleave, SDK 15 fps).
         # R77 at video mode 2 (1280x920 color, 640x460 depth, 30 fps).
         # The two PIDs differ, so auto-PID selection is sufficient for this
         # example. For production wiring set usb_port explicitly, e.g.

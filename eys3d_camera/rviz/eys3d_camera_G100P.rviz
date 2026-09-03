@@ -17,6 +17,23 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
+    - Alpha: 1
+      Class: rviz_default_plugins/RobotModel
+      Collision Enabled: false
+      Description File: ""
+      Description Source: Topic
+      Description Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /G100P_1/robot_description
+      Enabled: true
+      Name: RobotModel
+      TF Prefix: ""
+      Update Interval: 0
+      Value: true
+      Visual Enabled: true
     - Alpha: 0.5
       Cell Size: 1
       Class: rviz_default_plugins/Grid
@@ -43,11 +60,11 @@ Visualization Manager:
       Name: LeftColor
       Normalize Range: true
       Topic:
-        Depth: 5
+        Depth: 1
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /G100P_1/left_color
+        Value: /G100P_1/left_color/image_raw
       Value: true
     - Class: rviz_default_plugins/Image
       Enabled: true
@@ -57,11 +74,11 @@ Visualization Manager:
       Name: RightColor
       Normalize Range: true
       Topic:
-        Depth: 5
+        Depth: 1
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /G100P_1/right_color
+        Value: /G100P_1/right_color/image_raw
       Value: true
     - Class: rviz_default_plugins/Image
       Enabled: true
@@ -71,11 +88,11 @@ Visualization Manager:
       Name: DepthImage
       Normalize Range: false
       Topic:
-        Depth: 5
+        Depth: 1
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /G100P_1/depth_image
+        Value: /G100P_1/depth/image_raw
       Value: true
     # Minimal-overhead PointCloud2 display:
     #   Style=Points  → 1 screen-space pixel, no geometry-shader expansion
@@ -112,7 +129,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /G100P_1/pointcloud
+        Value: /G100P_1/depth/points
       Use Fixed Frame: true
       Use rainbow: false
       Value: true

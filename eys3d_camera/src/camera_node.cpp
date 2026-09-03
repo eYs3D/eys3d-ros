@@ -1,5 +1,6 @@
 #include "eys3d_camera/camera_node.hpp"
 
+#include <algorithm>
 #include <csignal>
 #include <cmath>
 #include <cstring>
@@ -34,6 +35,21 @@ rclcpp::QoS info_qos() {
     return q;
 }
 
+// No ranges here: declare_parameter() throws on one, unhandled across a
+// component boundary. build_device_config() enforces them.
+rcl_interfaces::msg::ParameterDescriptor ro(const char* text) {
+    rcl_interfaces::msg::ParameterDescriptor d;
+    d.description = text;
+    d.read_only = true;
+    return d;
+}
+
+rcl_interfaces::msg::ParameterDescriptor rw(const char* text) {
+    rcl_interfaces::msg::ParameterDescriptor d;
+    d.description = text;
+    return d;
+}
+
 std::string join_frame(const std::string& prefix, const std::string& leaf) {
     if (prefix.empty()) return leaf;
     return prefix + "_" + leaf;
@@ -54,11 +70,10 @@ std::string normalize_model(std::string s) {
     return s;
 }
 
-// rclcpp::init() on Foxy installs a SIGINT handler only. Re-raise
-// SIGINT from SIGTERM so container runtimes (docker stop, systemctl
-// stop, kubectl delete pod) reach the same rclcpp deferred-shutdown
-// path. Installed once per process so both the standalone executable
-// and the ComposableNodeContainer path get covered.
+// rclcpp::init() on Foxy installs a SIGINT handler only. Re-raise SIGINT
+// from SIGTERM so a container runtime's stop reaches the same rclcpp
+// deferred-shutdown path. Installed once per process, covering both the
+// executable and the component container.
 void install_sigterm_to_shutdown() {
     static std::once_flag once;
     std::call_once(once, [] {
@@ -76,12 +91,9 @@ CameraNode::CameraNode(const rclcpp::NodeOptions& options)
     install_sigterm_to_shutdown();
     declare_params();
 
-    // Static TF goes on /tf_static (TRANSIENT_LOCAL) regardless of
-    // the node-level intra-process setting. Some rclcpp versions
-    // reject TRANSIENT_LOCAL publishers in nodes with intra-process
-    // comms enabled; disabling IPC on this single publisher keeps
-    // /tf_static portable across distros. Other publishers on this
-    // node still follow the node-level IPC setting.
+    // Some rclcpp versions reject a TRANSIENT_LOCAL publisher in a node with
+    // intra-process comms on, so IPC is disabled for this publisher only;
+    // every other publisher follows the node-level setting.
     rclcpp::PublisherOptionsWithAllocator<std::allocator<void>> tf_static_opts;
     tf_static_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
     tf_static_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(
@@ -121,93 +133,87 @@ CameraNode::CameraNode(const rclcpp::NodeOptions& options)
     // L|R. LR modes always split; non-LR modes never do.
     split_color_ = vm.color_split;
 
-    // Topic names are unprefixed — the launch sets the ROS namespace to
-    // camera_name, so the fully-qualified form is /<camera_name>/<leaf>.
-    // Prefixing here would produce /<camera_name>/<camera_name>/<leaf>.
+    // Unprefixed: the launch sets the ROS namespace. camera_info must stay a
+    // sibling of image_raw for image_transport::CameraSubscriber.
     const std::string color_topic       = "left_color";
     const std::string color_right_topic = "right_color";
-    const std::string depth_topic       = "depth_image";
-    const std::string points_topic      = "pointcloud";
-
-    // Image publishers are gated by the active video mode (no point producing a
-    // depth topic in a color-only mode). camera_info publishers follow the
-    // same gating so /right_color/camera_info does not appear without a
-    // matching right_color image.
-    pub_color_info_ = create_publisher<sensor_msgs::msg::CameraInfo>(
-        color_topic + "/camera_info", info_qos());
-    pub_depth_info_ = create_publisher<sensor_msgs::msg::CameraInfo>(
-        depth_topic + "/camera_info", info_qos());
+    const std::string depth_topic       = "depth";
+    const std::string points_topic      = "depth/points";
 
     if (vm.has_color) {
-        // espdi_device decodes both YUYV and MJPEG inputs to rgb8 inline,
-        // so the publish path emits a uniform `sensor_msgs/Image` with
-        // `encoding=rgb8` regardless of the source wire format. Wide L|R
-        // splitting just slices the rgb8 raster row-by-row.
-        pub_color_ = create_publisher<sensor_msgs::msg::Image>(color_topic, image_qos());
+        // espdi_device decodes every wire format to rgb8, so the publish path is
+        // uniform; the wide L|R split just slices that raster row by row.
+        pub_color_ = create_publisher<sensor_msgs::msg::Image>(color_topic + "/image_raw", image_qos());
+        pub_color_info_ = create_publisher<sensor_msgs::msg::CameraInfo>(
+            color_topic + "/camera_info", info_qos());
         if (split_color_) {
-            pub_color_right_ = create_publisher<sensor_msgs::msg::Image>(color_right_topic, image_qos());
+            pub_color_right_ = create_publisher<sensor_msgs::msg::Image>(color_right_topic + "/image_raw", image_qos());
             pub_color_right_info_ = create_publisher<sensor_msgs::msg::CameraInfo>(
                 color_right_topic + "/camera_info", info_qos());
         }
     }
     if (vm.has_depth) {
-        pub_depth_  = create_publisher<sensor_msgs::msg::Image>(depth_topic, image_qos());
+        pub_depth_  = create_publisher<sensor_msgs::msg::Image>(depth_topic + "/image_raw", image_qos());
+        pub_depth_info_ = create_publisher<sensor_msgs::msg::CameraInfo>(
+            depth_topic + "/camera_info", info_qos());
         pub_points_ = create_publisher<sensor_msgs::msg::PointCloud2>(points_topic, image_qos());
     }
 
+    // build_device_config() throws on an out-of-range depth-range or filter
+    // value. Catch it and idle like any other config error, rather than letting
+    // the exception escape the constructor (std::terminate standalone; a failed
+    // component load inside a container).
+    DeviceConfig initial_cfg;
+    try {
+        initial_cfg = build_device_config(vm);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(),
+                     "Invalid configuration: %s; node will idle", e.what());
+        return;
+    }
     {
         // Initial population. No reader can race here — the parameter
         // callback is installed below this point.
         std::lock_guard<std::mutex> lk(cfg_mtx_);
-        cached_cfg_ = build_device_config(vm);
+        cached_cfg_ = initial_cfg;
     }
-    if (!device_->open(cached_cfg_)) {
+    // A failed open does not return: the service, watchdog and diagnostics
+    // surface is built regardless and the failure drops into the reconnect
+    // loop, which also covers a camera that enumerates shortly after start.
+    // Every device_ accessor below is safe on a closed handle.
+    const bool device_opened = device_->open(cached_cfg_);
+    if (!device_opened) {
         RCLCPP_ERROR(get_logger(),
                      "EspdiDevice::open() failed. Check that no other process holds the device "
                      "(lsof /dev/video*), the model PID matches the connected camera, and the "
-                     "USB cable supports the required bandwidth. Node will idle until restarted.");
-        return;
-    }
-    {
+                     "USB cable supports the required bandwidth. The watchdog will keep retrying.");
+    } else {
         std::lock_guard<std::mutex> lk(calib_mtx_);
         cached_calib_ = device_->calibration();
     }
 
-    publish_static_tf();
+    if (device_opened) publish_static_tf();
 
-    // Apply initial CT/PU values (ir_intensity, AE, AWB, exposure_time_step)
+    // Apply initial CT/PU values (ir_value, AE, AWB, exposure_time_step)
     // before registering the parameter-set callback to avoid feedback from
     // the initial declares.
     declare_and_apply_runtime_params();
     param_cb_handle_ = add_on_set_parameters_callback(
         [this](const std::vector<rclcpp::Parameter>& p){ return on_set_parameters(p); });
 
-    // Runtime stream control — two distinct cost / latency tiers.
-    //
-    //   /<cam>/pause   (SetBool: true=pause, false=resume)
-    //     Cheap state flip. SDK + USB keep streaming so the next frame
-    //     after resume is published immediately (~33 ms @ 30 fps), but
-    //     decode + filter + publish are all skipped while paused so the
-    //     driver's CPU load drops to roughly the cost of the USB drain.
-    //
-    //   /<cam>/standby (SetBool: true=standby, false=resume)
-    //     Heavy. APC_CloseDevice releases the V4L2 fd so USB traffic
-    //     stops entirely. The SDK handle, calibration, and ZD table are
-    //     kept, so resume reopens in ~200-400 ms without redoing the
-    //     full open() sequence. The watchdog reconnect loop is suppressed
-    //     while the operator has explicitly requested Standby — any
-    //     real USB disconnect during Standby is detected on the next
-    //     standby(false) attempt.
-    //
-    // Both controls toggle the colour + depth pair together — per-stream
-    // toggling was removed because interleave modes require both halves
-    // of the V4L2 stream to be active simultaneously and the disabled-
-    // single-stream code path silently stalled on those.
+    // pause / standby / hw_reset. The state contract is on StreamState in
+    // espdi_device.hpp. Both stream controls move colour and depth together:
+    // interleave modes need both halves of the V4L2 stream active.
     using SetBool = std_srvs::srv::SetBool;
     srv_pause_ = create_service<SetBool>(
         "pause",
         [this](const std::shared_ptr<SetBool::Request> req,
                std::shared_ptr<SetBool::Response> res) {
+            if (device_->selfcal_active()) {
+                res->success = false;
+                res->message = "refused: a self-calibration session is in progress";
+                return;
+            }
             const bool ok = device_->pause(req->data);
             res->success = ok;
             res->message = std::string("stream ") + (req->data ? "paused" : "resumed");
@@ -216,68 +222,139 @@ CameraNode::CameraNode(const rclcpp::NodeOptions& options)
         "standby",
         [this](const std::shared_ptr<SetBool::Request> req,
                std::shared_ptr<SetBool::Response> res) {
-            // Publish the operator's intent to the watchdog before
-            // closing or reopening the device, so a tick that races
-            // with the transition does not read the zero-frame
-            // interval as a disconnect.
-            user_wants_standby_.store(req->data, std::memory_order_release);
+            if (device_->selfcal_active()) {
+                res->success = false;
+                res->message = "refused: a self-calibration session is in progress";
+                return;
+            }
+            // Gated on connected: close() leaves stream_state stale.
+            const bool in_standby =
+                device_->stream_state() == EspdiDevice::StreamState::Standby;
+            if (conn_state_.load() == ConnState::kStreaming &&
+                req->data == in_standby) {
+                res->success = true;
+                res->message = std::string("standby already ") +
+                               (req->data ? "entered" : "exited");
+                return;
+            }
+
+            if (req->data) {
+                user_wants_standby_.store(true, std::memory_order_release);
+            } else {
+                // Re-anchor and force a DM_Quality re-apply before the resume
+                // restarts the fetch threads — see try_reconnect(). Defensive:
+                // firmware that resets either on STREAMON must not stamp the
+                // first post-resume frame in the past.
+                for (auto& latch : off_raster_warned_) latch.store(false, std::memory_order_relaxed);
+    dm_quality_applied_.store(false);
+                hw_anchor_us_.store(0, std::memory_order_relaxed);
+                ros_anchor_ns_.store(0, std::memory_order_relaxed);
+                time_anchor_set_.store(false, std::memory_order_release);
+            }
             const bool ok = device_->standby(req->data);
             res->success = ok;
             if (ok) {
                 if (!req->data) {
-                    // Re-apply the operator's current ir_intensity (the
-                    // SDK reopen restores cfg.ir_intensity which is the
-                    // launch-time value; runtime overrides written via
-                    // /parameters live only in the FW register that
-                    // APC_CloseDevice cleared).
-                    device_->set_ir_intensity(
-                        get_parameter("ir_intensity").as_int());
-                    // Force the next depth frame to re-apply DM_Quality —
-                    // V4L2 close keeps USB enumerated so today's firmware
-                    // preserves the register block across standby, but
-                    // mirror try_reconnect()'s defensive reset so a
-                    // future FW change that power-gates the sensor on
-                    // STREAMOFF cannot silently regress depth quality.
-                    dm_quality_applied_.store(false);
-                    // Re-anchor the timestamp pipeline: APC_OpenDevice2
-                    // re-negotiates IMAGE_SN_SYNC, and any firmware
-                    // variant that resets the hw timestamp counter on
-                    // STREAMOFF/STREAMON would otherwise stamp the first
-                    // post-resume frame in the past — violating REP-117
-                    // and freezing tf2 buffers. The reset re-establishes
-                    // the hw_us → rclcpp::Time mapping on the next
-                    // frame, mirroring try_reconnect(). Both halves of
-                    // the anchor (hw and ros) must be zeroed too;
-                    // stamp_from_hw_us uses CAS-from-zero to elect the
-                    // initialising thread, and a stale non-zero
-                    // hw_anchor_us_ would make every CAS fail and the
-                    // anchor never get re-established.
-                    hw_anchor_us_.store(0, std::memory_order_relaxed);
-                    ros_anchor_ns_.store(0, std::memory_order_relaxed);
-                    time_anchor_set_.store(false, std::memory_order_release);
-                    // Refresh the watchdog baseline AND re-arm the
-                    // startup grace so the first tick after standby(false)
-                    // does not fall through to the zero-frame check before
-                    // the SDK has had a chance to deliver the first
-                    // post-resume frame (~500 ms typical).
+                    // Before the calls below, which can throw.
+                    user_wants_standby_.store(false, std::memory_order_release);
+                    // The reopen restores the launch-time cfg.ir_value; a
+                    // runtime override lived only in the cleared FW register.
+                    device_->set_ir_value(
+                        get_parameter("ir_value").as_int());
+                    // Re-sync the flash-persisted CT/PU settings from the
+                    // firmware into the parameter store.
+                    resync_ct_pu_from_device();
                     watchdog_prev_stats_ = device_->stats();
-                    zero_frame_seconds_.store(0, std::memory_order_relaxed);
+                    color_silent_seconds_.store(0, std::memory_order_relaxed);
+                    depth_silent_seconds_.store(0, std::memory_order_relaxed);
                     startup_grace_seconds_.store(0, std::memory_order_relaxed);
-                    watchdog_armed_.store(false, std::memory_order_relaxed);
+                    cold_start_reopens_.store(0, std::memory_order_relaxed);
+                    color_armed_.store(false, std::memory_order_relaxed);
+                    depth_armed_.store(false, std::memory_order_relaxed);
                 }
                 res->message = std::string("standby ") + (req->data ? "entered" : "exited");
             } else {
-                // Reopen failed — clear the operator intent so the
-                // watchdog can try to recover the device.
+                // Handle is known closed; skip the watchdog timeout.
                 user_wants_standby_.store(false, std::memory_order_release);
-                res->message = "standby(false) reopen failed ; device left closed";
+                if (!req->data) declare_disconnected();
+                res->message = req->data
+                    ? "standby(true) failed ; device is not open"
+                    : "standby(false) reopen failed ; device left closed";
             }
         });
-    // Diagnostics — diagnostic_updater::Updater publishes on /diagnostics.
+    using Empty = std_srvs::srv::Empty;
+    srv_hw_reset_ = create_service<Empty>(
+        "hw_reset",
+        [this](const std::shared_ptr<Empty::Request>,
+               std::shared_ptr<Empty::Response>) {
+            // Empty service has no response field, so a refusal can only be
+            // logged; re-enumerating the device would kill a running session.
+            if (device_->selfcal_active()) {
+                RCLCPP_WARN(get_logger(),
+                            "hw_reset refused: a self-calibration session is in "
+                            "progress (stop it first)");
+                return;
+            }
+            RCLCPP_WARN(get_logger(),
+                        "hw_reset: resetting the camera over USB");
+            // stop() (join the fetch threads while the link is still up),
+            // reset_usb() (write the detach sequence; the host re-enumerates),
+            // then close() (release the now-stale handle).
+            device_->stop();
+            device_->reset_usb();
+            device_->close();
+            // Drive the node to Disconnected and let the watchdog reopen by the
+            // pinned serial / port. Clearing user_wants_standby_ lets the
+            // watchdog resume if the reset was issued from Standby. Lock-free:
+            // the executor is single-threaded and stop()/close() are idempotent.
+            user_wants_standby_.store(false, std::memory_order_release);
+            conn_state_.store(ConnState::kDisconnected);
+            watchdog_prev_stats_ = device_->stats();
+            color_armed_.store(false, std::memory_order_relaxed);
+            depth_armed_.store(false, std::memory_order_relaxed);
+            startup_grace_seconds_.store(0, std::memory_order_relaxed);
+            cold_start_reopens_.store(0, std::memory_order_relaxed);
+            color_silent_seconds_.store(0, std::memory_order_relaxed);
+            depth_silent_seconds_.store(0, std::memory_order_relaxed);
+            reconnect_poll_counter_ = 0;
+        });
+
+    // Self-calibration, exposed only when selfcal_enable is set.
+    //   /<cam>/selfcal/run    (action)  — run one session to completion and
+    //                                     resolve it (revert / keep / commit)
+    //   /<cam>/selfcal/commit (Trigger) — persist a kept result to the G2 slot
+    if (get_parameter("selfcal_enable").as_bool()) {
+        act_selfcal_run_ = rclcpp_action::create_server<SelfCalAction>(
+            this, "selfcal/run",
+            std::bind(&CameraNode::selfcal_handle_goal, this,
+                      std::placeholders::_1, std::placeholders::_2),
+            std::bind(&CameraNode::selfcal_handle_cancel, this,
+                      std::placeholders::_1),
+            std::bind(&CameraNode::selfcal_handle_accepted, this,
+                      std::placeholders::_1));
+        // Irreversible flash write; only ever on this explicit call.
+        srv_selfcal_commit_ = create_service<std_srvs::srv::Trigger>(
+            "selfcal/commit",
+            [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                   std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+                // Refuse while a run is in flight (would race the worker on the
+                // handle); the manual commit persists a kept result afterwards.
+                if (selfcal_run_goal_) {
+                    res->success = false;
+                    res->message = "commit refused: a self-calibration run is in "
+                                   "progress; wait for it to finish";
+                    return;
+                }
+                res->success = device_->commit_selfcal();
+                res->message = res->success
+                    ? "self-calibration committed to flash (G2 user slot)"
+                    : "commit refused: no committable result (see node log)";
+            });
+    }
+
     // Five tasks (device / color / depth / pointcloud / thermal) contribute
-    // one DiagnosticStatus each per array; the standard ROS diagnostic
-    // stack aggregates max(level) across them. Set diagnostics_rate_hz
-    // below 0.001 to disable the Updater entirely.
+    // one DiagnosticStatus each per array. diagnostics_rate_hz below 0.001
+    // disables the Updater entirely.
     const double diag_hz = get_parameter("diagnostics_rate_hz").as_double();
     if (diag_hz >= 0.001) {
         updater_ = std::make_unique<diagnostic_updater::Updater>(this);
@@ -290,6 +367,9 @@ CameraNode::CameraNode(const rclcpp::NodeOptions& options)
         updater_->add("depth",      this, &CameraNode::diagnose_depth);
         updater_->add("pointcloud", this, &CameraNode::diagnose_pc);
         updater_->add("thermal",    this, &CameraNode::diagnose_thermal);
+        // Self-calibration is an on-demand action, fully described by the
+        // selfcal/run feedback + result; it is not a continuous-stream health
+        // subsystem, so it gets no /diagnostics task.
         prev_stats_ = device_->stats();
         prev_stats_wall_ = now();
         RCLCPP_INFO(get_logger(), "/diagnostics rate: %.2f Hz", diag_hz);
@@ -311,6 +391,9 @@ CameraNode::CameraNode(const rclcpp::NodeOptions& options)
     cached_color_cb_ = vm.has_color ? color_cb : ColorFrameCb{};
     cached_depth_cb_ = vm.has_depth ? depth_cb : DepthFrameCb{};
     cached_pc_cb_    = vm.has_depth ? pc_cb    : PointCloudCb{};
+    color_configured_ = vm.has_color;
+    depth_configured_ = vm.has_depth;
+    color_rectified_  = color_is_rectified(vm.depth_data_type);
 
     // Install the subscriber gates BEFORE start() spawns the fetch threads
     // so the threads observe a fully-initialised gate on the very first
@@ -324,7 +407,7 @@ CameraNode::CameraNode(const rclcpp::NodeOptions& options)
         const bool right_subs = pub_color_right_ &&
                                 pub_color_right_->get_subscription_count() > 0;
         // Keep the color path running whenever colored_pointcloud is
-        // on and a /pointcloud subscriber exists, so the cloud paints
+        // on and a /depth/points subscriber exists, so the cloud paints
         // from a current color frame.
         const bool pc_needs_color = cached_cfg_.colored_pointcloud
             && pub_points_
@@ -334,9 +417,17 @@ CameraNode::CameraNode(const rclcpp::NodeOptions& options)
     device_->set_depth_gate([this]() {
         return pub_depth_ && pub_depth_->get_subscription_count() > 0;
     });
-    device_->start(ColorFrameCb(cached_color_cb_),
-                   DepthFrameCb(cached_depth_cb_),
-                   PointCloudCb(cached_pc_cb_));
+    if (device_opened) {
+        device_->start(ColorFrameCb(cached_color_cb_),
+                       DepthFrameCb(cached_depth_cb_),
+                       PointCloudCb(cached_pc_cb_));
+    } else {
+        // The initial open failed: enter the reconnect loop rather than
+        // stream. The watchdog polls kDisconnected and drives try_reconnect(),
+        // which publishes the static TF and re-applies CT/PU once the device
+        // appears.
+        conn_state_.store(ConnState::kDisconnected);
+    }
 
     // 1 Hz watchdog: detect USB disconnect and drive the reconnect loop.
     watchdog_prev_stats_ = device_->stats();
@@ -345,78 +436,123 @@ CameraNode::CameraNode(const rclcpp::NodeOptions& options)
 
     const char* color_topic_label =
         split_color_ ? "left_color + right_color" : "left_color";
-    RCLCPP_INFO(get_logger(),
-                "eys3d_camera '%s' running. Topics under '/%s/' (%s, depth_image, pointcloud).",
-                camera_name_.c_str(), camera_name_.c_str(), color_topic_label);
+    if (device_opened) {
+        RCLCPP_INFO(get_logger(),
+                    "eys3d_camera '%s' running. Streams under '/%s/' (%s, depth) plus depth/points.",
+                    camera_name_.c_str(), camera_name_.c_str(), color_topic_label);
+    } else {
+        RCLCPP_WARN(get_logger(),
+                    "eys3d_camera '%s' started without a device; waiting for the camera "
+                    "to appear on '/%s/'.",
+                    camera_name_.c_str(), camera_name_.c_str());
+    }
+}
+
+void CameraNode::declare_disconnected() {
+    device_->stop();
+    device_->close();
+    conn_state_.store(ConnState::kDisconnected);
+    color_armed_.store(false, std::memory_order_relaxed);
+    depth_armed_.store(false, std::memory_order_relaxed);
+    color_silent_seconds_.store(0, std::memory_order_relaxed);
+    depth_silent_seconds_.store(0, std::memory_order_relaxed);
+    startup_grace_seconds_.store(0, std::memory_order_relaxed);
+    // Cadence not reset here: the standby handler may retry faster than the poll.
 }
 
 void CameraNode::watchdog_tick() {
     if (!device_) return;
 
-    // Operator-requested Standby suppresses the watchdog entirely. With
-    // no fetch threads running the stats counters never advance, so the
-    // standard zero-frame check would otherwise misread the intentional
-    // pause as a disconnect and tear the SDK down. Skip the tick, refresh
-    // the stats baseline so the next non-standby tick starts from the
-    // current counts, and bail.
+    // Operator-requested Standby suppresses the watchdog: with no fetch
+    // threads the stats never advance, so the zero-frame check would misread
+    // the pause as a disconnect. Skip the tick, refresh the stats baseline,
+    // and bail.
     if (user_wants_standby_.load(std::memory_order_acquire)) {
         watchdog_prev_stats_ = device_->stats();
-        zero_frame_seconds_.store(0, std::memory_order_relaxed);
+        color_silent_seconds_.store(0, std::memory_order_relaxed);
+        depth_silent_seconds_.store(0, std::memory_order_relaxed);
         return;
     }
 
     if (conn_state_.load() == ConnState::kStreaming) {
         const auto cur = device_->stats();
-        const uint64_t f_color = cur.color_input_total - watchdog_prev_stats_.color_input_total;
-        const uint64_t f_depth = cur.depth_input_total - watchdog_prev_stats_.depth_input_total;
+        const uint64_t color_frames = cur.color_input_total - watchdog_prev_stats_.color_input_total;
+        const uint64_t depth_frames = cur.depth_input_total - watchdog_prev_stats_.depth_input_total;
         watchdog_prev_stats_ = cur;
-        // Slow modes (e.g. R77 mode 1 at 7 fps over USB 2.0) can take several
-        // seconds to deliver the first frame after open(). Hold the
-        // disconnect detector until streaming is proven to have started.
-        if (!watchdog_armed_.load(std::memory_order_relaxed)) {
-            if (cur.color_input_total > 0 || cur.depth_input_total > 0) {
-                watchdog_armed_.store(true, std::memory_order_relaxed);
-                zero_frame_seconds_.store(0, std::memory_order_relaxed);
-            } else {
-                const int grace =
-                    startup_grace_seconds_.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (grace >= 10) {
-                    // Final defensive check: a standby() that landed
-                    // between the top-of-tick guard and here would also
-                    // produce zero frames. Bail rather than tear the
-                    // SDK down.
-                    if (user_wants_standby_.load(std::memory_order_acquire)) return;
-                    RCLCPP_ERROR(get_logger(),
-                                 "watchdog: no frames within %d s of open; "
-                                 "declaring camera disconnected",
-                                 grace);
-                    device_->stop();
-                    device_->close();
-                    conn_state_.store(ConnState::kDisconnected);
-                    startup_grace_seconds_.store(0, std::memory_order_relaxed);
-                    reconnect_poll_counter_ = 0;
-                }
-            }
-            return;
-        }
-        if (f_color == 0 && f_depth == 0) {
-            const int silent =
-                zero_frame_seconds_.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (silent >= 3) {
+
+        // Frames since the baseline; the lifetime total is never reset.
+        if (color_frames > 0) color_armed_.store(true, std::memory_order_relaxed);
+        if (depth_frames > 0) depth_armed_.store(true, std::memory_order_relaxed);
+        const bool color_armed = color_armed_.load(std::memory_order_relaxed);
+        const bool depth_armed = depth_armed_.load(std::memory_order_relaxed);
+
+        // The SDK starts capture on the first fetch and leaves the stream
+        // unstarted when that fails, retrying forever; only a reopen clears it.
+        // 10 s, not the steady-state 3 s: R77 mode 1 at 7 fps over USB 2.0 takes
+        // several seconds to deliver its first frame.
+        const bool color_pending = color_configured_ && !color_armed;
+        const bool depth_pending = depth_configured_ && !depth_armed;
+        if (color_pending || depth_pending) {
+            const int grace_seconds =
+                startup_grace_seconds_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (grace_seconds >= 10) {
+                // A standby() that landed between the top-of-tick guard and
+                // here would also produce zero frames. Bail rather than tear
+                // the SDK down.
                 if (user_wants_standby_.load(std::memory_order_acquire)) return;
-                RCLCPP_ERROR(get_logger(),
-                             "watchdog: no frames for %d s; declaring camera disconnected",
-                             silent);
-                device_->stop();
-                device_->close();
-                conn_state_.store(ConnState::kDisconnected);
-                zero_frame_seconds_.store(0, std::memory_order_relaxed);
-                watchdog_armed_.store(false, std::memory_order_relaxed);
-                startup_grace_seconds_.store(0, std::memory_order_relaxed);
-                reconnect_poll_counter_ = 0;
+                const char* which = (color_pending && depth_pending) ? "colour+depth"
+                                    : color_pending ? "colour" : "depth";
+                // A reopen clears a stream the SDK failed to start, not a mode
+                // the link cannot carry; past the cap the device stays open so
+                // a stream that does work keeps running.
+                if (cold_start_reopens_.load(std::memory_order_relaxed)
+                        < kMaxColdStartReopens) {
+                    cold_start_reopens_.fetch_add(1, std::memory_order_relaxed);
+                    RCLCPP_ERROR(get_logger(),
+                                 "watchdog: %s delivered no frame within %d s of "
+                                 "open; declaring camera disconnected",
+                                 which, grace_seconds);
+                    declare_disconnected();
+                    return;
+                }
+                RCLCPP_ERROR_THROTTLE(
+                    get_logger(), *get_clock(), 60000,
+                    "watchdog: %s has delivered no frame after %d reopens; "
+                    "leaving the device open. Check that the active mode fits "
+                    "the negotiated USB link",
+                    which, kMaxColdStartReopens);
             }
+            // Fall through: a stream that did arm is still watched below.
         } else {
-            zero_frame_seconds_.store(0, std::memory_order_relaxed);
+            cold_start_reopens_.store(0, std::memory_order_relaxed);
+        }
+
+        // At least one stream is live. An armed stream that then goes silent
+        // is a per-stream stall — e.g. depth wedges in firmware while colour
+        // keeps flowing — which reconnect recovers even though the other
+        // stream is still delivering frames.
+        const bool color_silent = color_armed && color_frames == 0;
+        const bool depth_silent = depth_armed && depth_frames == 0;
+        // A stream that delivers resets only its own counter.
+        const int color_silent_seconds =
+            color_silent ? color_silent_seconds_.fetch_add(1, std::memory_order_relaxed) + 1
+                         : (color_silent_seconds_.store(0, std::memory_order_relaxed), 0);
+        const int depth_silent_seconds =
+            depth_silent ? depth_silent_seconds_.fetch_add(1, std::memory_order_relaxed) + 1
+                         : (depth_silent_seconds_.store(0, std::memory_order_relaxed), 0);
+
+        const int silent_seconds = std::max(color_silent_seconds, depth_silent_seconds);
+        if (silent_seconds >= 3) {
+            if (user_wants_standby_.load(std::memory_order_acquire)) return;
+            const bool color_stalled = color_silent_seconds >= 3;
+            const bool depth_stalled = depth_silent_seconds >= 3;
+            const char* which = (color_stalled && depth_stalled) ? "colour+depth"
+                                : color_stalled ? "colour" : "depth";
+            RCLCPP_ERROR(get_logger(),
+                         "watchdog: %s stream silent for %d s; "
+                         "declaring camera disconnected",
+                         which, silent_seconds);
+            declare_disconnected();
         }
         return;
     }
@@ -431,9 +567,11 @@ void CameraNode::watchdog_tick() {
                     static_cast<unsigned long>(attempts_now));
         watchdog_prev_stats_ = device_->stats();
         conn_state_.store(ConnState::kStreaming);
-        watchdog_armed_.store(false, std::memory_order_relaxed);
+        color_armed_.store(false, std::memory_order_relaxed);
+        depth_armed_.store(false, std::memory_order_relaxed);
         startup_grace_seconds_.store(0, std::memory_order_relaxed);
-        zero_frame_seconds_.store(0, std::memory_order_relaxed);
+        color_silent_seconds_.store(0, std::memory_order_relaxed);
+        depth_silent_seconds_.store(0, std::memory_order_relaxed);
         reconnect_attempts_.store(0, std::memory_order_relaxed);
     }
 }
@@ -449,6 +587,11 @@ bool CameraNode::try_reconnect() {
         std::lock_guard<std::mutex> lk(calib_mtx_);
         cached_calib_ = device_->calibration();
     }
+    // Re-publish the static TF from the (re-read) calibration. Latched
+    // TRANSIENT_LOCAL, so this is harmless on an ordinary reconnect and is the
+    // only place the tree is published when the initial open failed and the
+    // device appeared later.
+    publish_static_tf();
     // Reinstall gates before start() — see constructor for the rationale.
     device_->set_pc_gate([this]() {
         return pub_points_ && pub_points_->get_subscription_count() > 0;
@@ -459,7 +602,7 @@ bool CameraNode::try_reconnect() {
         const bool right_subs = pub_color_right_ &&
                                 pub_color_right_->get_subscription_count() > 0;
         // Keep the color path running whenever colored_pointcloud is
-        // on and a /pointcloud subscriber exists, so the cloud paints
+        // on and a /depth/points subscriber exists, so the cloud paints
         // from a current color frame.
         const bool pc_needs_color = cached_cfg_.colored_pointcloud
             && pub_points_
@@ -469,39 +612,52 @@ bool CameraNode::try_reconnect() {
     device_->set_depth_gate([this]() {
         return pub_depth_ && pub_depth_->get_subscription_count() > 0;
     });
+    // USB re-enumeration restarts the hw timestamp counter and power-cycles
+    // the registers, so the anchor and the DM_Quality flag are reset before
+    // start() respawns the fetch threads. Both anchor halves must go to zero
+    // -- stamp_from_hw_us elects its initialiser by CAS-from-zero.
+    for (auto& latch : off_raster_warned_) latch.store(false, std::memory_order_relaxed);
+    dm_quality_applied_.store(false);
+    hw_anchor_us_.store(0, std::memory_order_relaxed);
+    ros_anchor_ns_.store(0, std::memory_order_relaxed);
+    time_anchor_set_.store(false, std::memory_order_release);
     device_->start(ColorFrameCb(cached_color_cb_),
                    DepthFrameCb(cached_depth_cb_),
                    PointCloudCb(cached_pc_cb_));
     // Re-apply IR — projector boots OFF after every open().
-    device_->set_ir_intensity(get_parameter("ir_intensity").as_int());
-    // The firmware power-cycles register state on USB re-enumeration, so
-    // the next depth frame must re-apply the DM_Quality cfg.
-    dm_quality_applied_.store(false);
-    // The firmware hardware-timestamp counter restarts on USB re-enumeration.
-    // Clear the time anchor so the first post-reconnect frame re-establishes
-    // the mapping from hw_us to rclcpp::Time; otherwise published stamps
-    // would jump backwards and trip REP-117 consumers. Both halves of the
-    // anchor must be zeroed too — see standby() for the rationale.
-    hw_anchor_us_.store(0, std::memory_order_relaxed);
-    ros_anchor_ns_.store(0, std::memory_order_relaxed);
-    time_anchor_set_.store(false, std::memory_order_release);
+    device_->set_ir_value(get_parameter("ir_value").as_int());
+    // Re-sync the flash-persisted CT/PU settings from the firmware into the
+    // parameter store.
+    resync_ct_pu_from_device();
     return true;
 }
 
 CameraNode::~CameraNode() {
     RCLCPP_INFO(get_logger(), "~CameraNode()");
-    // Drop service and parameter callbacks first so no executor thread
-    // can enter pause() / standby() / on_set_parameters() against a
-    // device that is mid-shutdown. Reset releases the handles immediately;
-    // any in-flight callback returns to a stub before the next dispatch.
+    // Service and parameter callbacks go first, so no executor thread can
+    // enter pause() / standby() / hw_reset() / on_set_parameters() against a
+    // device that is mid-shutdown.
     srv_pause_.reset();
     srv_standby_.reset();
+    srv_hw_reset_.reset();
+    if (selfcal_run_timer_) selfcal_run_timer_->cancel();
+    selfcal_run_timer_.reset();
+    // Abort an in-flight self-cal goal so the client's result future is
+    // fulfilled instead of hanging on a silently-destroyed goal.
+    if (selfcal_run_goal_) {
+        auto res = std::make_shared<SelfCalAction::Result>();
+        res->outcome = "FAILED";
+        res->message = "node shutting down; self-calibration aborted";
+        selfcal_run_goal_->abort(res);
+        selfcal_run_goal_.reset();
+    }
+    act_selfcal_run_.reset();
+    srv_selfcal_commit_.reset();
     param_cb_handle_.reset();
-    // Cancel every wall timer before any member starts destructing.
-    // On a multi-threaded executor a timer tick on another thread can
-    // otherwise dereference device_ after it is destroyed.
-    // diagnostic_updater::Updater owns its own internal timer; releasing
-    // the unique_ptr below stops its callbacks before device_ goes away.
+    // Cancel every wall timer before any member destructs: on a
+    // multi-threaded executor a tick on another thread would otherwise
+    // dereference device_ after it is destroyed. Updater owns an internal
+    // timer, stopped by releasing the unique_ptr below.
     if (watchdog_timer_)     watchdog_timer_->cancel();
     updater_.reset();
     if (device_) device_->stop();
@@ -513,61 +669,80 @@ void CameraNode::declare_params() {
     // (or only when a re-open happens) is declared read_only so a
     // ros2 param set against it fails fast instead of returning success
     // and silently doing nothing.
-    auto ro = []() {
-        rcl_interfaces::msg::ParameterDescriptor d;
-        d.read_only = true;
-        return d;
-    };
 
     // Identity + binding (launch-only)
-    declare_parameter<std::string>("camera_name",       "eys3d_camera", ro());
-    declare_parameter<std::string>("model",             "G100P",        ro());
-    declare_parameter<int>        ("mode_id",           1,              ro());
-    declare_parameter<std::string>("video_modes_dir",   "",             ro());
-    declare_parameter<std::string>("dev_serial_number", "",             ro());
-    declare_parameter<std::string>("usb_port",          "",             ro());
-    declare_parameter<int>        ("depth_minimum_mm", -1,              ro());
-    declare_parameter<int>        ("depth_maximum_mm", -1,              ro());
-    // ir_intensity is declared with the other open()-time parameters so
-    // its launch value reaches DeviceConfig and is applied at IR pre-open.
-    // Runtime-tunable via ros2 param set.
-    declare_parameter<int>        ("ir_intensity",   -1);
-    declare_parameter<bool>       ("colored_pointcloud",       false, ro());
-    // Spatial filter (launch-only)
-    declare_parameter<bool>       ("spatial_filter",           false, ro());
-    declare_parameter<double>     ("spatial_filter_alpha",     0.5,   ro());
-    declare_parameter<int>        ("spatial_filter_delta",     20,    ro());
-    declare_parameter<int>        ("spatial_filter_magnitude", 2,     ro());
-    declare_parameter<int>        ("spatial_filter_holes_fill",  5,   ro());
-    // Temporal filter — runtime-tunable via ros2 param set; the
-    // device applies the change on the next depth frame. A false→true
-    // transition resets per-pixel history.
-    declare_parameter<bool>       ("temporal_filter",             false);
-    declare_parameter<double>     ("temporal_filter_alpha",       0.4);
-    declare_parameter<int>        ("temporal_filter_delta",       20);
-    declare_parameter<int>        ("temporal_filter_persistence", 3);
-    // Hole filling — launch-time only. Mode 0=off, 1=fill_from_left,
-    // 2=farthest_from_around, 3=nearest_from_around.
-    declare_parameter<int>        ("hole_filling",                0,   ro());
-    declare_parameter<double>     ("diagnostics_rate_hz", 1.0, ro());  // 0 = disabled
-    // Runtime CT/PU image controls (enable_auto_exposure,
-    // enable_auto_white_balance, exposure_time_step, power_line_frequency)
-    // are declared after the device is opened, using the SDK's current
-    // values as defaults. Launch overrides are written back to the camera
-    // only when explicitly supplied; otherwise the existing firmware
-    // configuration is preserved.
+    declare_parameter<std::string>("camera_name",       "eys3d_camera",
+        ro("ROS namespace and frame-id prefix."));
+    declare_parameter<std::string>("model",             "G100P",
+        ro("Camera model (G100P, G100Pi, R77, G62). Selects the video-mode catalogue."));
+    declare_parameter<int>        ("mode_id",           -1,
+        ro("Index into the per-model video-mode catalogue; -1 selects the signature mode for the negotiated USB link."));
+    declare_parameter<std::string>("video_modes_dir",   "",
+        ro("Directory holding the video-mode catalogues; empty uses the installed share directory."));
+    declare_parameter<std::string>("dev_serial_number", "",
+        ro("Bind to the device whose serial number contains this substring; empty binds the first device of the model."));
+    declare_parameter<std::string>("usb_port",          "",
+        ro("Bind by USB topology path, e.g. 2-3:1.0; empty binds the first device of the model."));
+    declare_parameter<int>        ("depth_near_mm",     -1,
+        ro("Near cutoff in mm for depth and the cloud; nearer pixels are zeroed. -1 selects the per-model default."));
+    declare_parameter<int>        ("depth_far_mm",      -1,
+        ro("Far cutoff in mm for depth and the cloud; farther pixels are zeroed. -1 selects the per-model default."));
+    // Declared here, with the open()-time parameters, so the launch value
+    // reaches DeviceConfig in time for the IR pre-open write.
+    declare_parameter<int>        ("ir_value",          -1,
+        rw("IR projector level. -1 resolves per mode: the model default when the mode carries depth or the module is mono, off for a colour-only mode on a colour sensor. 0 forces it off. Firmware range 0-6 on G100+/R77, 0-96 on G62."));
+    declare_parameter<bool>       ("colored_pointcloud",       false,
+        ro("Publish XYZRGB sampled from the latest colour frame; depth-only modes fall back to XYZ."));
+    declare_parameter<bool>       ("spatial_filter",           false,
+        ro("Enable the disparity-domain edge-aware IIR filter."));
+    declare_parameter<double>     ("spatial_filter_alpha",     0.5,
+        ro("Spatial smoothing strength, 0.0 to 1.0."));
+    declare_parameter<int>        ("spatial_filter_delta",     20,
+        ro("Spatial edge threshold in raw disparity units, 1 to 4095."));
+    declare_parameter<int>        ("spatial_filter_magnitude", 2,
+        ro("Spatial four-direction iterations, 1 to 5."));
+    declare_parameter<int>        ("spatial_filter_holes_fill",  0,
+        ro("Consecutive holes the spatial pass bridges per direction, 0 to 255; 0 disables bridging."));
+    declare_parameter<bool>       ("temporal_filter",             false,
+        rw("Enable the temporal filter. Switching it on resets the per-pixel history."));
+    declare_parameter<double>     ("temporal_filter_alpha",       0.4,
+        rw("Temporal blend weight, 0.0 to 1.0."));
+    declare_parameter<int>        ("temporal_filter_delta",       20,
+        rw("Temporal edge guard, 1 to 4095; disparity units after the spatial filter, mm otherwise."));
+    declare_parameter<int>        ("temporal_filter_persistence", 3,
+        rw("Validity-history pattern an invalid pixel must match to keep its last value, 0 to 8. 0 disables and 8 holds indefinitely; 1 is the strictest of the patterns and 7 the loosest."));
+    declare_parameter<int>        ("hole_filling",                0,
+        ro("Z-domain hole filling: 0 off, 1 fill_from_left, 2 farthest_from_around, 3 nearest_from_around."));
+    declare_parameter<double>     ("diagnostics_rate_hz",   1.0,
+        ro("/diagnostics publish rate in Hz; below 0.001 disables the publisher."));
+    // The runtime CT/PU controls are declared after the open, defaulting to
+    // the SDK's current values. A launch override is written back only when
+    // explicitly supplied; otherwise the firmware keeps its configuration.
 
-    // Frames — all default to "" → derived from camera_name at init.
-    declare_parameter<std::string>("base_frame",        "", ro());
-    declare_parameter<std::string>("left_color_frame",  "", ro());
-    declare_parameter<std::string>("right_color_frame", "", ro());
-    declare_parameter<std::string>("depth_frame",       "", ro());
-    declare_parameter<std::string>("points_frame",      "", ro());
+    declare_parameter<std::string>("base_frame",        "",
+        ro("frame_id of the camera base link; empty derives it from camera_name."));
+    declare_parameter<std::string>("left_color_frame",  "",
+        ro("frame_id of the left colour sensor; empty derives it from camera_name."));
+    declare_parameter<std::string>("right_color_frame", "",
+        ro("frame_id of the right colour sensor; empty derives it from camera_name."));
+    declare_parameter<std::string>("depth_frame",       "",
+        ro("frame_id of the depth sensor; empty derives it from camera_name."));
+    declare_parameter<std::string>("points_frame",      "",
+        ro("frame_id stamped on the point cloud; empty derives it from camera_name."));
 
-    declare_parameter<std::string>("dm_quality_cfg_dir", "", ro());
+    declare_parameter<std::string>("dm_quality_cfg_dir", "",
+        ro("Directory holding the DM_Quality register tables; empty uses the installed share directory."));
+
+    // selfcal_profile's default must name a shipped profile.
+    declare_parameter<bool>       ("selfcal_enable",     false,
+        ro("Expose the self-calibration action and commit service."));
+    declare_parameter<std::string>("selfcal_config_dir", "",
+        ro("Directory holding the self-calibration profiles; empty uses the installed share directory."));
+    declare_parameter<std::string>("selfcal_profile",    "maintenance_dock",
+        rw("Self-calibration tuning profile name, resolved under the profile directory."));
 }
 
-bool CameraNode::load_video_mode(VideoMode& out, std::string& err) const {
+bool CameraNode::load_video_mode(VideoMode& out, std::string& err) {
     std::string dir = get_parameter("video_modes_dir").as_string();
     if (dir.empty()) {
         try {
@@ -579,7 +754,7 @@ bool CameraNode::load_video_mode(VideoMode& out, std::string& err) const {
         }
     }
     const std::string model = normalize_model(get_parameter("model").as_string());
-    const int mode_id       = get_parameter("mode_id").as_int();
+    int mode_id             = get_parameter("mode_id").as_int();
 
     const auto modes = load_video_modes(dir, model);
     if (modes.empty()) {
@@ -589,46 +764,151 @@ bool CameraNode::load_video_mode(VideoMode& out, std::string& err) const {
     }
     RCLCPP_INFO(get_logger(), "%s", format_mode_table(model, modes).c_str());
 
+    const auto info = load_model_info(dir, model);
+    if (!info) {
+        err = "model header missing or invalid in " + model + ".yaml";
+        return false;
+    }
+    model_info_ = *info;
+
+    // mode_id < 0 = auto: probe the negotiated USB link and pick the model's
+    // signature default mode for it. An explicit mode_id is instead validated
+    // against the link at open time.
+    if (mode_id < 0) {
+        if (model_info_.signature_mode.empty()) {
+            err = "mode_id=auto: no signature_mode entry in " + model + ".yaml";
+            return false;
+        }
+        DeviceConfig probe_cfg;
+        probe_cfg.serial_number = get_parameter("dev_serial_number").as_string();
+        probe_cfg.usb_port      = get_parameter("usb_port").as_string();
+        probe_cfg.expected_pid  = model_info_.pid;
+        const auto usb = device_->probe_usb_type(probe_cfg);
+
+        // Fall back to the lowest-bandwidth signature (USB2 when declared):
+        // it opens on either link, and open() validates the real one.
+        auto it = model_info_.signature_mode.begin();
+        if (usb) {
+            const auto exact = model_info_.signature_mode.find(*usb);
+            if (exact != model_info_.signature_mode.end()) {
+                it = exact;
+                RCLCPP_INFO(get_logger(),
+                            "mode_id=auto -> %d (signature mode for the negotiated USB%d link)",
+                            it->second, *usb);
+            } else {
+                RCLCPP_WARN(get_logger(),
+                            "mode_id=auto: no signature_mode entry for a USB%d link in %s.yaml; "
+                            "falling back to mode %d (USB%d signature)",
+                            *usb, model.c_str(), it->second, it->first);
+            }
+        } else {
+            RCLCPP_WARN(get_logger(),
+                        "mode_id=auto: could not probe the USB link type (camera not attached?); "
+                        "falling back to mode %d (USB%d signature)",
+                        it->second, it->first);
+        }
+        mode_id = it->second;
+    }
+
     const auto found = find_mode(modes, mode_id);
     if (!found) {
         err = "mode_id=" + std::to_string(mode_id) + " not found in " + model + ".yaml";
         return false;
     }
+
     out = *found;
     return true;
 }
 
 DeviceConfig CameraNode::build_device_config(const VideoMode& vm) const {
-    DeviceConfig c;
-    c.color_width      = vm.color_width;
-    c.color_height     = vm.color_height;
-    c.color_format     = vm.color_format;
-    c.depth_width      = vm.depth_width;
-    c.depth_height     = vm.depth_height;
-    c.depth_data_type  = vm.depth_data_type;
-    c.zd_index         = vm.zd_index;
-    c.framerate        = vm.framerate;
-    c.interleave       = vm.interleave;
-    c.depth_minimum_mm = get_parameter("depth_minimum_mm").as_int();
-    c.depth_maximum_mm = get_parameter("depth_maximum_mm").as_int();
-    c.ir_intensity               = get_parameter("ir_intensity").as_int();
-    c.colored_pointcloud                   = get_parameter("colored_pointcloud").as_bool();
-    c.spatial_filter_enabled   = get_parameter("spatial_filter").as_bool();
-    c.spatial_filter_alpha     = get_parameter("spatial_filter_alpha").as_double();
-    c.spatial_filter_delta     = get_parameter("spatial_filter_delta").as_int();
-    c.spatial_filter_magnitude = get_parameter("spatial_filter_magnitude").as_int();
-    c.spatial_filter_holes_fill  = get_parameter("spatial_filter_holes_fill").as_int();
-    c.temporal_filter_enabled     = get_parameter("temporal_filter").as_bool();
-    c.temporal_filter_alpha       = get_parameter("temporal_filter_alpha").as_double();
-    c.temporal_filter_delta       = get_parameter("temporal_filter_delta").as_int();
-    c.temporal_filter_persistence = get_parameter("temporal_filter_persistence").as_int();
-    c.hole_filling                = get_parameter("hole_filling").as_int();
+    DeviceConfig cfg;
+    cfg.color_width      = vm.color_width;
+    cfg.color_height     = vm.color_height;
+    cfg.color_format     = vm.color_format;
+    cfg.depth_width      = vm.depth_width;
+    cfg.depth_height     = vm.depth_height;
+    cfg.depth_data_type  = vm.depth_data_type;
+    cfg.zd_index         = vm.zd_index;
+    cfg.framerate        = vm.framerate;
+    cfg.interleave       = vm.interleave;
+    cfg.mode_usb         = vm.usb;
+    cfg.depth_near_mm    = get_parameter("depth_near_mm").as_int();
+    cfg.depth_far_mm     = get_parameter("depth_far_mm").as_int();
+    // Z14 depth is a 14-bit distance in mm: the far plane cannot exceed
+    // 2^14 - 1, and near must sit in front of far. A launch value past that
+    // is a config error, caught here before the device opens.
+    if (cfg.depth_far_mm > 16383)
+        throw std::invalid_argument("depth_far_mm exceeds the 16383 mm Z14 limit");
+    if (cfg.depth_near_mm > 16383)
+        throw std::invalid_argument("depth_near_mm exceeds the 16383 mm Z14 limit");
+    // Order near against the far plane actually applied; depth_far_mm may be
+    // -1, meaning the per-model default.
+    const int effective_far =
+        cfg.depth_far_mm > 0 ? cfg.depth_far_mm : model_info_.depth_far_mm;
+    if (cfg.depth_near_mm > 0 && effective_far > 0 &&
+        cfg.depth_near_mm >= effective_far)
+        throw std::invalid_argument("depth_near_mm must be < depth_far_mm");
+    cfg.ir_value         = get_parameter("ir_value").as_int();
+    cfg.colored_pointcloud     = get_parameter("colored_pointcloud").as_bool();
+    cfg.spatial_filter_enabled   = get_parameter("spatial_filter").as_bool();
+    cfg.spatial_filter_alpha     = get_parameter("spatial_filter_alpha").as_double();
+    cfg.spatial_filter_delta     = get_parameter("spatial_filter_delta").as_int();
+    cfg.spatial_filter_magnitude = get_parameter("spatial_filter_magnitude").as_int();
+    cfg.spatial_filter_holes_fill = get_parameter("spatial_filter_holes_fill").as_int();
+    cfg.temporal_filter_enabled     = get_parameter("temporal_filter").as_bool();
+    cfg.temporal_filter_alpha       = get_parameter("temporal_filter_alpha").as_double();
+    cfg.temporal_filter_delta       = get_parameter("temporal_filter_delta").as_int();
+    cfg.temporal_filter_persistence = get_parameter("temporal_filter_persistence").as_int();
+    cfg.hole_filling                = get_parameter("hole_filling").as_int();
     // Drives the wide-YUYV split decode in the device layer.
-    c.split_color      = split_color_;
-    c.serial_number    = get_parameter("dev_serial_number").as_string();
-    c.usb_port         = get_parameter("usb_port").as_string();
-    c.model            = normalize_model(get_parameter("model").as_string());
-    return c;
+    cfg.split_color      = split_color_;
+    cfg.serial_number    = get_parameter("dev_serial_number").as_string();
+    cfg.usb_port         = get_parameter("usb_port").as_string();
+    cfg.model            = normalize_model(get_parameter("model").as_string());
+    // Per-model constants from the catalogue header.
+    cfg.expected_pid     = model_info_.pid;
+    cfg.mono             = model_info_.mono;
+    cfg.ir_default       = model_info_.ir_default;
+    cfg.default_near_mm  = model_info_.depth_near_mm;
+    cfg.default_far_mm   = model_info_.depth_far_mm;
+    cfg.selfcal_enable     = get_parameter("selfcal_enable").as_bool();
+    cfg.selfcal_config_dir = get_parameter("selfcal_config_dir").as_string();
+    // Empty selfcal_config_dir resolves to the in-package profiles, mirroring
+    // how video_modes_dir falls back to the package share.
+    if (cfg.selfcal_enable && cfg.selfcal_config_dir.empty()) {
+        try {
+            cfg.selfcal_config_dir =
+                ament_index_cpp::get_package_share_directory("eys3d_camera") +
+                "/config/selfcal";
+        } catch (const std::exception&) {
+            // Leave empty; start_selfcal() will report a missing profile.
+        }
+    }
+
+    // The device layer would silently clamp these (a
+    // spatial_filter_magnitude of 99 becomes 5), so they are range-checked
+    // here; the constructor catches the throw and idles rather than running
+    // a configuration the operator did not ask for. Bounds match the kernel
+    // ceilings and on_set_parameters().
+    auto check_int = [](const char* name, long v, long lo, long hi) {
+        if (v < lo || v > hi)
+            throw std::invalid_argument(
+                std::string(name) + " must be in [" + std::to_string(lo) + ", " +
+                std::to_string(hi) + "]");
+    };
+    auto check_unit = [](const char* name, double v) {
+        if (v < 0.0 || v > 1.0)
+            throw std::invalid_argument(std::string(name) + " must be in [0.0, 1.0]");
+    };
+    check_int ("spatial_filter_delta",        cfg.spatial_filter_delta,        1, 4095);
+    check_int ("spatial_filter_magnitude",    cfg.spatial_filter_magnitude,    1, 5);
+    check_int ("spatial_filter_holes_fill",   cfg.spatial_filter_holes_fill,   0, 255);
+    check_int ("temporal_filter_delta",       cfg.temporal_filter_delta,       1, 4095);
+    check_int ("temporal_filter_persistence", cfg.temporal_filter_persistence, 0, 8);
+    check_int ("hole_filling",                cfg.hole_filling,                0, 3);
+    check_unit("spatial_filter_alpha",        cfg.spatial_filter_alpha);
+    check_unit("temporal_filter_alpha",       cfg.temporal_filter_alpha);
+    return cfg;
 }
 
 rclcpp::Time CameraNode::stamp_from_hw_us(uint64_t hw_us) {
@@ -661,28 +941,81 @@ EspdiDevice::Calibration CameraNode::snapshot_calib() const {
 
 sensor_msgs::msg::CameraInfo CameraNode::build_camera_info(
     const std::string& frame_id, const rclcpp::Time& stamp,
-    int width, int height, const EspdiDevice::LensCalibration& lens,
-    bool valid) const {
+    int width, int height, const EspdiDevice::Calibration& calib,
+    InfoStream stream) const {
     sensor_msgs::msg::CameraInfo ci;
     ci.header.stamp = stamp;
     ci.header.frame_id = frame_id;
     ci.width  = static_cast<uint32_t>(width);
     ci.height = static_cast<uint32_t>(height);
-    if (valid) {
-        ci.distortion_model = "plumb_bob";
-        ci.d.assign(lens.D.begin(), lens.D.end());
-        for (size_t i = 0; i < 9;  ++i) ci.k[i] = lens.K[i];
-        for (size_t i = 0; i < 9;  ++i) ci.r[i] = lens.R[i];
+    // Left zeroed when the rectify log did not load: a client may read
+    // k[0] == 0.0 as an uncalibrated camera.
+    if (calib.valid) {
+        const bool left_eye  = stream != InfoStream::kRightColor;
+        const bool rectified = stream == InfoStream::kDepth || color_rectified_;
+        const auto& lens = left_eye ? calib.left : calib.right;
+        const double ps = EspdiDevice::raster_scale(calib.out_height, height);
         for (size_t i = 0; i < 12; ++i) ci.p[i] = lens.P[i];
+        for (int i : {0, 2, 3, 5, 6, 7}) ci.p[i] *= ps;
+        // Tx = -fx' * B, Ty = -fy' * B; the log's baseline is millimetres.
+        ci.p[3] /= 1000.0;
+        ci.p[7] /= 1000.0;
+
+        if (rectified) {
+            // Zeroed rather than emptied: image_geometry reads an empty d as
+            // UNKNOWN and throws on rectifyImage().
+            ci.k = {ci.p[0], ci.p[1], ci.p[2],
+                    ci.p[4], ci.p[5], ci.p[6],
+                    ci.p[8], ci.p[9], ci.p[10]};
+            ci.r = {1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0};
+            ci.distortion_model = "plumb_bob";
+            ci.d.assign(5, 0.0);
+        } else {
+            // D acts on normalised coordinates and never scales. Eight are
+            // stored; a five-coefficient lens leaves k4..k6 zero.
+            const double ks = EspdiDevice::raster_scale(calib.in_height, height);
+            for (size_t i = 0; i < 9; ++i) ci.k[i] = lens.K[i];
+            for (int i : {0, 2, 4, 5}) ci.k[i] *= ks;
+            for (size_t i = 0; i < 9; ++i) ci.r[i] = lens.R[i];
+            const bool eight = std::any_of(lens.D.begin() + 5, lens.D.end(),
+                                           [](double v) { return v != 0.0; });
+            ci.distortion_model = eight ? "rational_polynomial" : "plumb_bob";
+            ci.d.assign(lens.D.begin(), lens.D.begin() + (eight ? 8 : 5));
+        }
+        warn_if_off_raster(ci, stream);
     }
     return ci;
+}
+
+// A principal point far off centre means the intrinsics are at another
+// raster. Both K and P: the raw form scales them by independent factors.
+void CameraNode::warn_if_off_raster(const sensor_msgs::msg::CameraInfo& ci,
+                                    InfoStream stream) const {
+    constexpr double kMaxOffCentre = 0.25;
+    const double w = static_cast<double>(ci.width);
+    const double h = static_cast<double>(ci.height);
+    if (w <= 0.0 || h <= 0.0) return;
+    const auto off = [](double c, double extent) {
+        return std::abs(c / extent - 0.5) > kMaxOffCentre;
+    };
+    const bool bad_k = off(ci.k[2], w) || off(ci.k[5], h);
+    const bool bad_p = off(ci.p[2], w) || off(ci.p[6], h);
+    if (!bad_k && !bad_p) return;
+    auto& latch = off_raster_warned_[static_cast<size_t>(stream)];
+    if (latch.exchange(true, std::memory_order_relaxed)) return;
+    RCLCPP_WARN(get_logger(),
+                "%s: principal point k (%.2f, %.2f) p (%.2f, %.2f) is not "
+                "centred in the %ux%u image; the intrinsics do not describe "
+                "this raster",
+                ci.header.frame_id.c_str(), ci.k[2], ci.k[5],
+                ci.p[2], ci.p[6], ci.width, ci.height);
 }
 
 void CameraNode::on_color(FrameBuffer&& f) {
     if (!pub_color_ || pub_color_->get_subscription_count() == 0) return;
     RCLCPP_INFO_ONCE(get_logger(),
-                     "on_color: first frame (sn=%d, %dx%d, %zu bytes, rgb8)",
-                     f.serial_number, f.width, f.height, f.data.size());
+                     "on_color: first frame (frame=%d, %dx%d, %zu bytes, rgb8)",
+                     f.frame_number, f.width, f.height, f.data.size());
     const auto stamp = stamp_from_hw_us(f.hw_timestamp_us);
 
     auto msg = std::make_unique<sensor_msgs::msg::Image>();
@@ -699,20 +1032,15 @@ void CameraNode::on_color(FrameBuffer&& f) {
     const auto calib = snapshot_calib();
     pub_color_info_->publish(std::make_unique<sensor_msgs::msg::CameraInfo>(
         build_camera_info(left_color_optical_frame_, stamp, f.width,
-                          f.height, calib.left, calib.valid)));
+                          f.height, calib, InfoStream::kLeftColor)));
 }
 
 void CameraNode::publish_split_color(FrameBuffer&& f) {
-    // Wide-color modes pack L|R into one wide raster. Two cases:
-    //
-    //   Pre-split (YUYV wide, default):  espdi_device decoded the wide
-    //     YUYV directly into f.data (left) and f.data_right (right) via
-    //     simd::yuyv_to_rgb8_split. Both buffers are moved straight into
-    //     Image messages — no per-pixel copy at this layer.
-    //
-    //   Wide intermediate (MJPEG wide):  espdi_device decoded the whole
-    //     wide raster into f.data and left f.data_right empty. The
-    //     half-width Image buffers are produced by row-by-row memcpy.
+    // Wide-color modes pack L|R into one raster, in two shapes:
+    //   YUYV   f.data and f.data_right already hold the two halves; both
+    //          move straight into Image messages.
+    //   MJPEG  f.data holds the wide raster and f.data_right is empty;
+    //          the half-width buffers come from a row-by-row memcpy.
     if (!pub_color_) return;
     const bool publish_left  = pub_color_->get_subscription_count() > 0;
     const bool publish_right = pub_color_right_ &&
@@ -793,19 +1121,19 @@ void CameraNode::publish_split_color(FrameBuffer&& f) {
     if (publish_left) {
         pub_color_info_->publish(std::make_unique<sensor_msgs::msg::CameraInfo>(
             build_camera_info(left_color_optical_frame_, stamp, half_w,
-                              f.height, calib.left, calib.valid)));
+                              f.height, calib, InfoStream::kLeftColor)));
     }
     if (publish_right && pub_color_right_info_) {
         pub_color_right_info_->publish(std::make_unique<sensor_msgs::msg::CameraInfo>(
             build_camera_info(right_color_optical_frame_, stamp, half_w,
-                              f.height, calib.right, calib.valid)));
+                              f.height, calib, InfoStream::kRightColor)));
     }
 }
 
 void CameraNode::on_depth(FrameBuffer&& f) {
     if (!pub_depth_) return;
-    RCLCPP_INFO_ONCE(get_logger(), "on_depth: first frame (sn=%d, %dx%d, %zu bytes)",
-                     f.serial_number, f.width, f.height, f.data.size());
+    RCLCPP_INFO_ONCE(get_logger(), "on_depth: first frame (frame=%d, %dx%d, %zu bytes)",
+                     f.frame_number, f.width, f.height, f.data.size());
 
     if (!dm_quality_applied_.exchange(true) && !dm_quality_cfg_dir_.empty()) {
         RCLCPP_INFO(get_logger(),
@@ -832,7 +1160,7 @@ void CameraNode::on_depth(FrameBuffer&& f) {
     const auto calib = snapshot_calib();
     pub_depth_info_->publish(std::make_unique<sensor_msgs::msg::CameraInfo>(
         build_camera_info(depth_optical_frame_, stamp, f.width,
-                          f.height, calib.left, calib.valid)));
+                          f.height, calib, InfoStream::kDepth)));
 }
 
 void CameraNode::on_point_cloud(std::vector<uint8_t>&& xyz_bytes,
@@ -844,9 +1172,7 @@ void CameraNode::on_point_cloud(std::vector<uint8_t>&& xyz_bytes,
     RCLCPP_INFO_ONCE(get_logger(),
                      "on_point_cloud: first cloud (%u valid points, sample xyz=[%.3f, %.3f, %.3f] m, point_step=%u)",
                      valid_points, xyz[0], xyz[1], xyz[2], point_step);
-    // Periodic point-cloud sample at DEBUG level only; use --log-level DEBUG
-    // when tuning. Static clock avoids the per-frame shared_ptr allocation
-    // inside the macro.
+    // Static clock: the THROTTLE macro evaluates it on every expansion.
     static rclcpp::Clock pc_throttle_clock{RCL_STEADY_TIME};
     RCLCPP_DEBUG_THROTTLE(get_logger(), pc_throttle_clock, 10000,
                           "pointcloud: %u valid points, sample xyz=[%.3f, %.3f, %.3f] m",
@@ -893,24 +1219,27 @@ void CameraNode::declare_and_apply_runtime_params() {
     RCLCPP_INFO(get_logger(),
                 "Camera CT/PU state on open: IR=%d (read_ok=%d), AE=%s (ok=%d), "
                 "exposure_step=%d (ok=%d), AWB=%s (ok=%d), power_line=%d (ok=%d)",
-                state.ir_intensity, state.ir_read_ok,
+                state.ir_value, state.ir_read_ok,
                 state.auto_exposure ? "auto" : "manual", state.auto_exposure_read_ok,
                 state.exposure_time_step, state.exposure_read_ok,
                 state.auto_white_balance ? "auto" : "manual", state.awb_read_ok,
                 state.power_line_frequency, state.plf_read_ok);
 
-    // Declare runtime parameters seeded from current SDK state so
-    // `ros2 param get` reflects the actual camera configuration.
-    // ir_intensity is declared in declare_params() to reach open().
-    declare_parameter<bool> ("enable_auto_exposure",             state.auto_exposure);
-    declare_parameter<bool> ("enable_auto_white_balance",            state.auto_white_balance);
-    declare_parameter<int>  ("exposure_time_step",   state.exposure_time_step);
-    declare_parameter<int>  ("power_line_frequency", state.power_line_frequency);
+    // Seeded from the SDK's current state so `ros2 param get` reflects the
+    // camera. ir_value is declared in declare_params() to reach open().
+    declare_parameter<bool> ("auto_exposure",      state.auto_exposure,
+        rw("Automatic exposure. Seeded from the camera; written back only when set."));
+    declare_parameter<bool> ("auto_white_balance", state.auto_white_balance,
+        rw("Automatic white balance. Seeded from the camera; written back only when set. Rejected on monochrome modules."));
+    declare_parameter<int>  ("exposure_time_step",   state.exposure_time_step,
+        rw("Manual exposure as a log2 register step, -13 to 3. Applies only while auto_exposure is false."));
+    declare_parameter<int>  ("power_line_frequency", state.power_line_frequency,
+        rw("Flicker rejection: 1 = 50 Hz, 2 = 60 Hz."));
 
-    // Always apply ir_intensity at launch so the projector is lit without
-    // an extra parameter call. -1 = per-PID default, 0 = off, positive
-    // integer = raw level.
-    device_->set_ir_intensity(get_parameter("ir_intensity").as_int());
+    // Always apply ir_value at launch so the projector is lit without
+    // an extra parameter call. -1 = mode-resolved default (see
+    // EspdiDevice::open), 0 = off, positive integer = raw level.
+    device_->set_ir_value(get_parameter("ir_value").as_int());
 
     // Other CT/PU values are written back only when explicitly overridden
     // at launch. The overrides map covers both NodeOptions overrides and
@@ -920,14 +1249,36 @@ void CameraNode::declare_and_apply_runtime_params() {
     auto was_overridden = [&](const std::string& name) {
         return overrides.find(name) != overrides.end();
     };
-    if (was_overridden("enable_auto_exposure"))
-        device_->set_auto_exposure(get_parameter("enable_auto_exposure").as_bool());
-    if (was_overridden("enable_auto_white_balance"))
-        device_->set_auto_white_balance(get_parameter("enable_auto_white_balance").as_bool());
-    if (was_overridden("exposure_time_step") && !get_parameter("enable_auto_exposure").as_bool())
+    if (was_overridden("auto_exposure"))
+        device_->set_auto_exposure(get_parameter("auto_exposure").as_bool());
+    if (!model_info_.mono && was_overridden("auto_white_balance"))
+        device_->set_auto_white_balance(get_parameter("auto_white_balance").as_bool());
+    if (was_overridden("exposure_time_step") && !get_parameter("auto_exposure").as_bool())
         (void)device_->set_exposure_time_step(get_parameter("exposure_time_step").as_int());
     if (was_overridden("power_line_frequency"))
         device_->set_power_line_frequency(get_parameter("power_line_frequency").as_int());
+}
+
+void CameraNode::resync_ct_pu_from_device() {
+    if (!device_) return;
+    // The firmware is the source of truth (see the declaration): read it and
+    // update the store to match. Fields the firmware did not report are
+    // skipped; exposure_time_step applies only in manual mode and
+    // power_line_frequency must be a valid mains value.
+    const auto s = device_->read_runtime_state();
+    std::vector<rclcpp::Parameter> updates;
+    // auto_exposure=false makes on_set_parameters re-apply exposure_time_step,
+    // so hold it back until the exposure value reads back too.
+    if (s.auto_exposure_read_ok && (s.auto_exposure || s.exposure_read_ok))
+        updates.emplace_back("auto_exposure", s.auto_exposure);
+    if (s.awb_read_ok && !model_info_.mono)
+        updates.emplace_back("auto_white_balance", s.auto_white_balance);
+    if (s.exposure_read_ok && !s.auto_exposure)
+        updates.emplace_back("exposure_time_step", s.exposure_time_step);
+    if (s.plf_read_ok && (s.power_line_frequency == 1 || s.power_line_frequency == 2))
+        updates.emplace_back("power_line_frequency", s.power_line_frequency);
+    if (!updates.empty())
+        set_parameters(updates);
 }
 
 rcl_interfaces::msg::SetParametersResult CameraNode::on_set_parameters(
@@ -943,40 +1294,50 @@ rcl_interfaces::msg::SetParametersResult CameraNode::on_set_parameters(
     // partial writes leave the FW in a confusing state.
     for (const auto& p : params) {
         const auto& name = p.get_name();
-        if (name == "ir_intensity") {
-            // Per-model firmware ranges: G100+ 0..9, R77 0..6, G62 0..96.
-            // Clamp at the parameter layer so out-of-range writes are
-            // rejected with a clear message instead of being silently
-            // pinned to the FW limit.
-            int max_ir = 9;
-            const std::string model = normalize_model(get_parameter("model").as_string());
-            if      (model == "G62") max_ir = 96;
-            else if (model == "R77") max_ir = 6;
+        if (name == "ir_value") {
+            // Range comes from the model catalogue, the same source the
+            // driver opens the device with. Rejecting here keeps an
+            // out-of-range write from being silently pinned to the FW
+            // limit further down. Negative = re-resolve for the active mode.
             if (p.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER ||
-                p.as_int() < 0 || p.as_int() > max_ir) {
+                (p.as_int() >= 0 &&
+                 (p.as_int() < model_info_.ir_min || p.as_int() > model_info_.ir_max))) {
                 result.successful = false;
-                result.reason = "ir_intensity must be int in [0, " +
-                                std::to_string(max_ir) + "] for model " + model;
+                result.reason = "ir_value must be int in [" +
+                                std::to_string(model_info_.ir_min) + ", " +
+                                std::to_string(model_info_.ir_max) + "] for model " +
+                                model_info_.model + ", or negative for the mode default";
                 return result;
             }
-        } else if (name == "enable_auto_exposure" || name == "enable_auto_white_balance") {
+        } else if (name == "auto_exposure" || name == "auto_white_balance") {
             if (p.get_type() != rclcpp::ParameterType::PARAMETER_BOOL) {
                 result.successful = false;
                 result.reason = name + " must be bool";
                 return result;
             }
-        } else if (name == "exposure_time_step") {
-            if (p.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER ||
-                p.as_int() < -100 || p.as_int() > 100) {
+            // Monochrome sensors have no colour path, so white balance is
+            // meaningless — reject it instead of letting the FW error out.
+            if (name == "auto_white_balance" && model_info_.mono) {
                 result.successful = false;
-                result.reason = "exposure_time_step must be int in [-100, 100]";
+                result.reason = model_info_.model +
+                                " is a monochrome camera; it has no white balance";
+                return result;
+            }
+        } else if (name == "exposure_time_step") {
+            // Written straight to CT_EXPOSURE_TIME_ABSOLUTE as a signed log2
+            // step; the hardware register only spans [-13, 3].
+            if (p.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER ||
+                p.as_int() < -13 || p.as_int() > 3) {
+                result.successful = false;
+                result.reason = "exposure_time_step must be int in [-13, 3] (signed log2 exposure register)";
                 return result;
             }
         } else if (name == "power_line_frequency") {
+            // Firmware only accepts 50/60 Hz; UVC 0 (off) and 3 (auto) are rejected.
             if (p.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER ||
-                p.as_int() < 0 || p.as_int() > 3) {
+                (p.as_int() != 1 && p.as_int() != 2)) {
                 result.successful = false;
-                result.reason = "power_line_frequency must be int in [0..3] (0=off, 1=50Hz, 2=60Hz, 3=auto)";
+                result.reason = "power_line_frequency must be 1 (50Hz) or 2 (60Hz)";
                 return result;
             }
         } else if (name == "temporal_filter") {
@@ -1014,11 +1375,9 @@ rcl_interfaces::msg::SetParametersResult CameraNode::on_set_parameters(
         // mode_id) are accepted unchanged; rclcpp permits arbitrary parameters
         // to be set even when the node does not consume them.
     }
-    // Collect any temporal-filter changes in the incoming batch and
-    // merge them with the current parameter values, so a single API
-    // call carries the full {enabled, alpha, delta, persistence}
-    // tuple. get_parameter() still returns the pre-update values at
-    // this point, which is the desired baseline for the merge.
+    // Merge temporal-filter changes in this batch with the current values so
+    // one API call carries the full {enabled, alpha, delta, persistence} tuple.
+    // get_parameter() still returns the pre-update values here.
     bool   t_enabled     = get_parameter("temporal_filter").as_bool();
     double t_alpha       = get_parameter("temporal_filter_alpha").as_double();
     int    t_delta       = get_parameter("temporal_filter_delta").as_int();
@@ -1032,50 +1391,60 @@ rcl_interfaces::msg::SetParametersResult CameraNode::on_set_parameters(
         else if (name == "temporal_filter_persistence") { t_persistence = p.as_int();    t_changed = true; }
     }
 
+    // A batch can have more than one failing write; append, do not overwrite.
+    auto add_reason = [&result](const std::string& msg) {
+        if (!result.reason.empty()) result.reason += "; ";
+        result.reason += msg;
+    };
+
     for (const auto& p : params) {
         const auto& name = p.get_name();
         bool ok = true;
-        if (name == "ir_intensity") {
-            ok = device_->set_ir_intensity(p.as_int());
-        } else if (name == "enable_auto_exposure") {
+        if (name == "ir_value") {
+            ok = device_->set_ir_value(p.as_int());
+        } else if (name == "auto_exposure") {
             ok = device_->set_auto_exposure(p.as_bool());
-            // Re-apply the current exposure_time_step parameter when
-            // AE transitions to off so the manual value takes effect
-            // immediately. A firmware reject is surfaced through
-            // result.reason so the operator sees a hint when the
-            // parameter store and FW state diverge.
+            // Re-apply exposure_time_step when AE goes off so the manual
+            // value takes effect immediately; a firmware reject is
+            // reported through result.reason.
             if (ok && !p.as_bool()) {
-                const int step = get_parameter("exposure_time_step").as_int();
+                // This callback runs before the store commits, so an
+                // exposure_time_step in the same batch is not in the store yet.
+                int step = get_parameter("exposure_time_step").as_int();
+                for (const auto& q : params) {
+                    if (q.get_name() == "exposure_time_step") { step = q.as_int(); break; }
+                }
                 if (!device_->set_exposure_time_step(step)) {
-                    result.reason = "exposure_time_step accepted into parameter store, "
+                    add_reason("exposure_time_step accepted into parameter store, "
                                     "but firmware rejected the immediate write; the "
-                                    "value will be retried on the next enable_auto_exposure transition";
+                                    "value will be retried on the next auto_exposure transition");
                 }
             }
         } else if (name == "exposure_time_step") {
-            const bool ae_on = get_parameter("enable_auto_exposure").as_bool();
+            const bool ae_on = get_parameter("auto_exposure").as_bool();
             if (!ae_on) {
-                // Some firmware versions reject specific exposure values via
-                // the UVC CT path. Surface the SDK rejection in result.reason
-                // so a consumer using the parameter API sees a hint, but keep
-                // result.successful=true so the parameter store still holds
-                // the value for the next enable_auto_exposure transition.
+                // Some firmware rejects specific exposure values over the UVC CT
+                // path. Report it in result.reason but keep successful=true, so
+                // the store holds the value for the next auto_exposure transition.
                 if (!device_->set_exposure_time_step(p.as_int())) {
-                    result.reason = "exposure_time_step accepted into parameter store, "
+                    add_reason("exposure_time_step accepted into parameter store, "
                                     "but firmware rejected the immediate write; the "
-                                    "value will be retried on the next enable_auto_exposure transition";
+                                    "value will be retried on the next auto_exposure transition");
                 }
             }
             // When AE is on the value is held for the next manual transition.
-        } else if (name == "enable_auto_white_balance") {
+        } else if (name == "auto_white_balance") {
             ok = device_->set_auto_white_balance(p.as_bool());
         } else if (name == "power_line_frequency") {
             ok = device_->set_power_line_frequency(p.as_int());
         }
         if (!ok) {
-            result.successful = false;
-            result.reason = "SDK rejected " + name;
-            return result;
+            // A failure here is a firmware reject of an already-validated value.
+            // successful stays true rather than discarding the batch -- earlier
+            // writes in this loop already reached the chip. The value is retried
+            // on the next reconnect or auto_exposure transition.
+            add_reason("firmware rejected the immediate write of " + name +
+                            "; the value is kept in the parameter store and retried later");
         }
     }
     if (t_changed) {
@@ -1158,13 +1527,10 @@ void CameraNode::diagnose_device(diagnostic_updater::DiagnosticStatusWrapper& s)
     } else if (stream_state == SS::Paused) {
         s.summary(DS::OK, "streaming (paused — publish gated by operator)");
     } else {
-        // Aggregate liveness: connected and Active but every configured
-        // stream is below 50% of expected (or zero) → ERROR at the
-        // device level. Per-stream WARN is already surfaced by the
-        // color and depth tasks; this branch catches the "device looks
-        // open but firmware has stopped delivering anything" case.
-        // color_input_fps == 0 in D-only modes is normal — only count
-        // it as dead when the configured stream stops.
+        // Connected and Active but every configured stream below half its
+        // expected rate -> ERROR; the per-stream tasks already carry their own
+        // WARN. color_input_fps == 0 is normal in D-only modes, so colour
+        // counts as dead only once it has been seen running.
         const bool color_configured = diag_snap_.cur.color_input_total > 0
             || diag_snap_.color_input_fps > 0.0;
         const bool color_dead = color_configured
@@ -1273,7 +1639,7 @@ void CameraNode::diagnose_pc(diagnostic_updater::DiagnosticStatusWrapper& s) {
         s.addf("compute_max_ms", "%.2f", diag_snap_.cur.pc_compute_max_us / 1000.0);
         s.add ("publish_total",  diag_snap_.cur.pc_publish_total);
     } else if (diag_snap_.cur.pc_publish_total > 0) {
-        status_str = "idle (no /pointcloud subscriber)";
+        status_str = "idle (no /depth/points subscriber)";
         s.summary(DS::OK, status_str);
         s.addf("publish_fps",    "%.2f", 0.0);
         s.addf("compute_max_ms", "%.2f", diag_snap_.cur.pc_compute_max_us / 1000.0);
@@ -1295,6 +1661,13 @@ void CameraNode::diagnose_thermal(diagnostic_updater::DiagnosticStatusWrapper& s
         s.summary(DS::OK, "(disconnected — SDK handle released)");
         return;
     }
+    // Pause the sensor read during a self-cal session: selfk's worker writes cy
+    // on the shared handle without sdk_mtx, so a concurrent control read could
+    // interleave two UVC transfers on one handle.
+    if (device_->selfcal_active()) {
+        s.summary(DS::OK, "paused (self-calibration in progress)");
+        return;
+    }
     // APC_GetTemperature is a USB roundtrip; the Updater calls this at
     // diagnostics_rate_hz so the cost is one read per tick.
     const auto thermal = device_->read_temperature();
@@ -1305,6 +1678,189 @@ void CameraNode::diagnose_thermal(diagnostic_updater::DiagnosticStatusWrapper& s
     } else {
         s.summary(DS::OK, "ok");
         s.addf("temperature_c", "%.2f", thermal.celsius);
+    }
+}
+
+rclcpp_action::GoalResponse CameraNode::selfcal_handle_goal(
+    const rclcpp_action::GoalUUID&,
+    std::shared_ptr<const SelfCalAction::Goal>) {
+    if (!device_->selfcal_available()) {
+        RCLCPP_WARN(get_logger(), "selfcal/run rejected: not available");
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+    if (device_->selfcal_active() || selfcal_run_goal_) {
+        RCLCPP_WARN(get_logger(),
+                    "selfcal/run rejected: a session is already running");
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::CancelResponse CameraNode::selfcal_handle_cancel(
+    std::shared_ptr<SelfCalGoalHandle>) {
+    // A session runs to completion and cannot be interrupted; if the result is
+    // worse it auto-reverts, so there is nothing a cancel needs to undo.
+    RCLCPP_WARN(get_logger(),
+                "selfcal/run: cancel rejected — a session cannot be interrupted");
+    return rclcpp_action::CancelResponse::REJECT;
+}
+
+void CameraNode::selfcal_handle_accepted(std::shared_ptr<SelfCalGoalHandle> gh) {
+    const auto goal = gh->get_goal();
+    const std::string profile = goal->profile.empty()
+        ? get_parameter("selfcal_profile").as_string() : goal->profile;
+    selfcal_run_auto_commit_shift_px_ = goal->auto_commit_shift_px;
+
+    if (!device_->start_selfcal(profile)) {
+        auto res = std::make_shared<SelfCalAction::Result>();
+        res->outcome = "FAILED";
+        res->message = "could not start self-calibration (see node log)";
+        gh->abort(res);
+        return;
+    }
+    selfcal_run_goal_ = gh;
+    // The one-shot profile runs ~20-30 s, then the A/B re-check adds a few more;
+    // give a generous deadline before declaring a timeout and reverting.
+    selfcal_run_deadline_ = now() + rclcpp::Duration(60, 0);
+    selfcal_run_timer_ = create_wall_timer(
+        std::chrono::milliseconds(250),
+        std::bind(&CameraNode::selfcal_run_tick, this));
+    RCLCPP_INFO(get_logger(), "selfcal/run started (profile='%s')", profile.c_str());
+}
+
+void CameraNode::selfcal_run_tick() {
+    if (!selfcal_run_goal_) {
+        if (selfcal_run_timer_) selfcal_run_timer_->cancel();
+        return;
+    }
+    // A disconnect mid-run is recovered by the watchdog's reopen (which reloads
+    // flash); fail the goal promptly instead of polling a dead session.
+    if (conn_state_.load() != ConnState::kStreaming) {
+        auto res = std::make_shared<SelfCalAction::Result>();
+        res->outcome = "FAILED";
+        res->message = "camera disconnected during calibration; aborted";
+        selfcal_run_goal_->abort(res);
+        selfcal_run_goal_.reset();
+        if (selfcal_run_timer_) {
+            selfcal_run_timer_->cancel();
+            selfcal_run_timer_.reset();
+        }
+        return;
+    }
+    const auto st = device_->selfcal_status();
+
+    const bool terminal = st.state == "COMPLETED" || st.state == "STOPPED" ||
+                          st.state == "ERROR";
+    // After the SDK converges, the worker runs the A/B re-check before the
+    // session is resolvable; surface that as a distinct feedback phase.
+    const bool rechecking = terminal && !st.resolve_ready;
+
+    auto fb = std::make_shared<SelfCalAction::Feedback>();
+    fb->phase = rechecking ? "RECHECK" : st.phase;
+    fb->progress = st.progress;
+    fb->processed_frames = static_cast<uint32_t>(st.processed_frames);
+    fb->valid_ratio_latest = st.valid_ratio_latest;
+    selfcal_run_goal_->publish_feedback(fb);
+
+    const bool timed_out = now() >= selfcal_run_deadline_;
+    // Wait for the A/B re-check to finish (resolve_ready) before acting, unless
+    // the deadline has passed.
+    if (!(terminal && st.resolve_ready) && !timed_out) {
+        return;
+    }
+
+    auto res = std::make_shared<SelfCalAction::Result>();
+    // The driver's own wall-clock deadline can fire before the SDK ever
+    // produces a result, leaving st.outcome empty; report that case as
+    // TIMEOUT rather than shipping an empty outcome string.
+    res->outcome = timed_out ? "TIMEOUT" : st.outcome;
+    res->valid_ratio_first = st.valid_ratio_first;
+    res->valid_ratio_latest = st.valid_ratio_latest;
+    res->valid_ratio_delta = st.valid_ratio_delta;
+    res->correction_level = st.correction_level;
+    res->cy_shift_px = st.cy_shift_px;
+    res->recheck_verdict = st.ab_verdict;
+    res->recheck_ratio_before = st.ab_ratio_initial;
+    res->recheck_ratio_after = st.ab_ratio_final;
+
+    // Resolve on the SDK outcome plus the A/B re-check. Anything that is not
+    // SUCCESS or NO_CHANGE (including a hard ERROR / empty outcome) is a failure
+    // and reverts; only a SUCCESS reaches the keep/commit paths below.
+    const bool failed = timed_out ||
+                        (st.outcome != "SUCCESS" && st.outcome != "NO_CHANGE");
+
+    if (failed) {
+        // Roll the registers back to the pre-session calibration.
+        res->reverted = device_->revert_selfcal();
+        const char* why = timed_out ? "timed out" : "calibration failed";
+        res->message = res->reverted
+            ? std::string(why) + "; reverted to the previous calibration"
+            : std::string(why) + "; ROLLBACK ALSO FAILED — the camera is on the "
+              "rejected alignment until it is power-cycled";
+    } else if (st.outcome == "NO_CHANGE") {
+        // Nothing changed; restore the pre-session cy (a safe no-op). Not
+        // applied, reverted, or committed.
+        device_->revert_selfcal();
+        res->message = "calibration already optimal; no change made";
+    } else if (st.ab_verdict == "worse") {
+        // SUCCESS moved cy, but the live A/B re-check shows the new alignment is
+        // actually worse on this scene. Roll it back.
+        res->reverted = device_->revert_selfcal();
+        res->message = res->reverted
+            ? "the re-check showed the new alignment was worse; reverted"
+            : "the re-check showed the new alignment was worse, but the rollback "
+              "failed — the camera is on the rejected alignment until it is "
+              "power-cycled";
+    } else if (st.ab_verdict == "inconclusive") {
+        // Could not certify an improvement (scene too unstable during the
+        // re-check, or the difference was within noise). Be conservative.
+        res->reverted = device_->revert_selfcal();
+        res->message = res->reverted
+            ? "could not verify an improvement (unstable scene during the "
+              "re-check); reverted — hold the camera still and re-run"
+            : "could not verify an improvement, and the rollback failed — the "
+              "camera is on the rejected alignment until it is power-cycled";
+    } else if (selfcal_run_auto_commit_shift_px_ >= 0.0f && st.can_commit &&
+               st.cy_shift_px >= selfcal_run_auto_commit_shift_px_) {
+        // Verified better (or re-check skipped) and the cy shift is large enough
+        // to persist automatically.
+        if (device_->commit_selfcal()) {
+            res->applied = true;
+            res->committed = true;
+            res->message = "verified improved and committed to flash";
+        } else {
+            device_->keep_selfcal();
+            res->applied = true;
+            res->message = "verified improved and kept live; flash commit failed (see log)";
+        }
+    } else {
+        // Verified better (or re-check skipped), kept live for review.
+        device_->keep_selfcal();
+        res->applied = true;
+        res->message = "verified improved and kept live; call selfcal/commit to persist";
+    }
+
+    RCLCPP_INFO(get_logger(),
+                "selfcal/run resolved: outcome=%s recheck=%s(%.3f->%.3f) "
+                "reverted=%d committed=%d",
+                res->outcome.c_str(), res->recheck_verdict.c_str(),
+                res->recheck_ratio_before, res->recheck_ratio_after,
+                res->reverted ? 1 : 0, res->committed ? 1 : 0);
+
+    // Abort when the session did not reach a usable answer, or when a rollback
+    // it intended did not take; a deliberate revert is the designed outcome and
+    // succeeds. res->outcome carries the detail either way.
+    const bool meant_to_revert =
+        (st.ab_verdict == "worse" || st.ab_verdict == "inconclusive");
+    if (failed || (meant_to_revert && !res->reverted)) {
+        selfcal_run_goal_->abort(res);
+    } else {
+        selfcal_run_goal_->succeed(res);
+    }
+    selfcal_run_goal_.reset();
+    if (selfcal_run_timer_) {
+        selfcal_run_timer_->cancel();
+        selfcal_run_timer_.reset();
     }
 }
 

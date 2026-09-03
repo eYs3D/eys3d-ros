@@ -1,0 +1,74 @@
+<?xml version="1.0"?>
+<!-- eYs3D G62 stereo depth camera.
+
+     <name>_link sits at the depth start point: laterally centered
+     between the two imagers, on the optical-axis height, Z' = 3.1 mm
+     behind the camera front face. The running driver publishes every
+     per-stream frame under this link on /tf_static, so only the base
+     link is modelled here — attach it to the robot at the same pose
+     the physical camera is mounted. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:macro name="eys3d_G62" params="name:=G62_1 parent *origin">
+    <joint name="${name}_joint" type="fixed">
+      <xacro:insert_block name="origin"/>
+      <parent link="${parent}"/>
+      <child link="${name}_link"/>
+    </joint>
+    <link name="${name}_link">
+      <!-- Single COLLADA mesh carrying both materials: the grey case and
+           the black front plate. Colours come from the mesh, so no URDF
+           <material> is set (one would override the whole mesh). -->
+      <visual>
+        <geometry>
+          <mesh filename="package://eys3d_camera/meshes/G62.dae"/>
+        </geometry>
+      </visual>
+      <collision>
+        <origin xyz="-0.00433 0 0"/>
+        <geometry>
+          <box size="0.01498 0.05 0.02"/>
+        </geometry>
+      </collision>
+      <xacro:property name="m" value="0.0293"/>
+      <xacro:property name="sx" value="0.01498"/>
+      <xacro:property name="sy" value="0.05"/>
+      <xacro:property name="sz" value="0.02"/>
+      <inertial>
+        <origin xyz="-0.00433 0 0"/>
+        <mass value="${m}"/>
+        <inertia ixx="${m/12*(sy*sy+sz*sz)}" ixy="0" ixz="0"
+                 iyy="${m/12*(sx*sx+sz*sz)}" iyz="0"
+                 izz="${m/12*(sx*sx+sy*sy)}"/>
+      </inertial>
+    </link>
+
+    <!-- Mounting-hole frames: four M1.6 on the back.
+         Positions come from the factory CAD; orientation matches
+         ${name}_link. -->
+    <joint name="${name}_back_screw1_frame_joint" type="fixed">
+      <origin xyz="-0.0118  0.0218  0.00425" rpy="0 0 0"/>
+      <parent link="${name}_link"/>
+      <child link="${name}_back_screw1_frame"/>
+    </joint>
+    <link name="${name}_back_screw1_frame"/>
+    <joint name="${name}_back_screw2_frame_joint" type="fixed">
+      <origin xyz="-0.0118  0.0218 -0.00425" rpy="0 0 0"/>
+      <parent link="${name}_link"/>
+      <child link="${name}_back_screw2_frame"/>
+    </joint>
+    <link name="${name}_back_screw2_frame"/>
+    <joint name="${name}_back_screw3_frame_joint" type="fixed">
+      <origin xyz="-0.0118 -0.0218  0.00425" rpy="0 0 0"/>
+      <parent link="${name}_link"/>
+      <child link="${name}_back_screw3_frame"/>
+    </joint>
+    <link name="${name}_back_screw3_frame"/>
+    <joint name="${name}_back_screw4_frame_joint" type="fixed">
+      <origin xyz="-0.0118 -0.0218 -0.00425" rpy="0 0 0"/>
+      <parent link="${name}_link"/>
+      <child link="${name}_back_screw4_frame"/>
+    </joint>
+    <link name="${name}_back_screw4_frame"/>
+  </xacro:macro>
+</robot>

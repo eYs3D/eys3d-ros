@@ -4,6 +4,7 @@
 #include <thread>
 
 #include "eSPDI.h"
+#include "espdi_error.hpp"
 #include <rclcpp/logging.hpp>
 
 namespace eys3d_camera {
@@ -47,24 +48,24 @@ bool load_zd_table(void* sdk_handle, void* dev_sel_info,
         if (rc == APC_OK) break;
         if (rc != APC_READFLASHFAIL) break;
         RCLCPP_WARN(rclcpp::get_logger(logger()),
-                    "APC_GetZDTable(index=%d) rc=%d (flash read), "
+                    "APC_GetZDTable(index=%d) %s (flash read), "
                     "retry %d/%d after %d ms",
-                    zd_index, rc,
+                    zd_index, espdi_strerror(rc).c_str(),
                     attempt + 1, kMaxAttempts, kBackoffMs);
         std::this_thread::sleep_for(std::chrono::milliseconds(kBackoffMs));
     }
 
     if (rc != APC_OK) {
         RCLCPP_WARN(rclcpp::get_logger(logger()),
-                    "APC_GetZDTable(index=%d) failed rc=%d",
-                    zd_index, rc);
+                    "APC_GetZDTable(index=%d) failed: %s",
+                    zd_index, espdi_strerror(rc).c_str());
         return false;
     }
-    if (actual_len < 2 || (actual_len & 1) != 0) {
+    if (actual_len < 2 || (actual_len & 1) != 0 || actual_len > kBufBytes) {
         RCLCPP_WARN(rclcpp::get_logger(logger()),
                     "APC_GetZDTable returned implausible length %d "
-                    "(expected even, >= 2 bytes)",
-                    actual_len);
+                    "(expected even, 2..%d bytes)",
+                    actual_len, kBufBytes);
         return false;
     }
 

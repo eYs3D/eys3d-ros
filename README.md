@@ -22,20 +22,39 @@ standard REP-103 frame tree. Supports ROS 2 Foxy, Humble, and Jazzy.
 ## Installation
 
 ```bash
-sudo apt install ros-$ROS_DISTRO-diagnostic-updater
+sudo apt install ros-$ROS_DISTRO-diagnostic-updater \
+                 ros-$ROS_DISTRO-robot-state-publisher ros-$ROS_DISTRO-xacro \
+                 ros-$ROS_DISTRO-rviz2
 ```
 
-Place this package under your workspace `src/` and build:
+The per-model launches default to `urdf:=true` and `rviz:=true` and will not
+start without `robot_state_publisher`, `xacro` and `rviz2`. Pass
+`urdf:=false rviz:=false` to run without them.
+
+Place both packages — `eys3d_camera` and `eys3d_camera_interfaces` (the
+self-calibration action definition) — under your workspace `src/` and build.
+`--packages-up-to` builds the interfaces first:
 
 ```bash
 cd ~/ros2_ws
-colcon build --packages-select eys3d_camera --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon build --packages-up-to eys3d_camera --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
 
-The per-model launches open RViz by default; install it once with
-`sudo apt install ros-$ROS_DISTRO-rviz2`, or pass `rviz:=false` to skip
-the visualiser.
+
+### Device Permissions
+
+The driver opens the camera as a normal user. If device open fails with a
+permission error, install the bundled udev rule so the eSPDI SDK can reach
+the USB device:
+
+```bash
+sudo cp install/eys3d_camera/share/eys3d_camera/udev/99-eys3d.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Then replug the camera. The rule grants access to eYs3D devices (USB vendor
+`3438`); alternatively, add your user to the `video` group and re-login.
 
 ---
 
@@ -58,12 +77,32 @@ With `camera_name=G100P_1` (matches the per-model defaults):
 
 | Topic | Type | Description |
 |---|---|---|
-| `/G100P_1/left_color` | `sensor_msgs/Image` | Left color image, always `rgb8` (YUYV and MJPEG sources are decoded inline; grayscale-source modules deliver R=G=B). Rectified or raw is determined by the active video mode. |
-| `/G100P_1/right_color` | `sensor_msgs/Image` | Right color image; published only in wide-color modes that carry L\|R on one endpoint (`split_lr: true` in the video-mode YAML) |
-| `/G100P_1/depth_image` | `sensor_msgs/Image` (`16UC1`, mm, REP-118) | Depth in millimetres |
-| `/G100P_1/pointcloud` | `sensor_msgs/PointCloud2` | XYZ float32 in ROS base axes (metres); XYZRGB when `colored_pointcloud:=true`. The bundled RViz layout colours the cloud with FlatColor; switch the PointCloud display's `Color Transformer` to `RGB8` to render the colour channel |
+| `/G100P_1/left_color/image_raw` | `sensor_msgs/Image` | Left color image, always `rgb8` (YUYV and MJPEG sources are decoded inline; grayscale-source modules deliver R=G=B). Rectified or raw is determined by the active video mode. |
+| `/G100P_1/right_color/image_raw` | `sensor_msgs/Image` | Right color image; published only in wide-color modes that carry L\|R on one endpoint (`split_lr: true` in the video-mode YAML) |
+| `/G100P_1/depth/image_raw` | `sensor_msgs/Image` (`16UC1`, mm, REP-118) | Depth in millimetres |
+| `/G100P_1/depth/points` | `sensor_msgs/PointCloud2` | XYZ float32 in ROS base axes (metres); XYZRGB when `colored_pointcloud:=true`. The bundled RViz layout colours the cloud with FlatColor; switch the PointCloud display's `Color Transformer` to `RGB8` to render the colour channel |
 | `/G100P_1/<stream>/camera_info` | `sensor_msgs/CameraInfo` | Intrinsics, one per matching Image frame (same `header.stamp`) |
 | `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | Health metrics, 1 Hz |
+
+### CameraInfo and Distortion Coefficients
+
+Each `camera_info` describes the image published on its own topic.
+
+Depth is rectified in every mode, and color is rectified in every mode whose
+catalogue name carries an apostrophe (`L'+D`, `L'+R'+D`). On those topics `k`
+is the left 3x3 of `p`, `d` is zero (`plumb_bob`) and `r` is the identity: the
+camera has already removed the distortion, so there is nothing left to undo.
+
+The `L+R` and `L+R+D` modes publish the raw sensor image on the color topics.
+There `k` and `d` are the factory lens model at the published resolution and
+`r` is the rectification rotation, so `image_proc` rectifies them normally.
+Read `distortion_model` rather than assuming a length: the driver reports
+`rational_polynomial` with eight coefficients or `plumb_bob` with five,
+following the calibration stored in that individual module.
+
+`p` is the projection matrix in both cases and is the right source of
+intrinsics for pose estimation (AprilTag, PnP, SLAM). For a stereo pair,
+`p[3]` of the right camera is `-fx * baseline` in metres.
 
 ### Subscriber QoS
 
@@ -90,9 +129,9 @@ The stereo camera has no dedicated third sensor for RGB output.
 To deliver both "color without IR dots" and "high-quality depth"
 at the same time, eYs3D introduces an interleave mode:
 
-- **Even frame — IR off → `/left_color`**.
+- **Even frame — IR off → `/left_color/image_raw`**.
   Without IR dots in the scene, the output is a clean RGB image.
-- **Odd frame — IR on → `/depth_image`**.
+- **Odd frame — IR on → `/depth/image_raw`**.
   IR dots provide structured features for the stereo matcher,
   yielding higher-quality depth.
 
@@ -101,11 +140,11 @@ so the per-stream FPS is halved.
 
 #### Timestamp consequence
 
-Using `mode_id=1` (the G100+ default) as an example:
+Using `mode_id=1` (the G100+ default on USB 3.0) as an example:
 
 ```
-sensor 60 fps  ──SDK interleave──>  /G100P_1/left_color   30 fps
-                                 └  /G100P_1/depth_image  30 fps
+sensor 60 fps  ──SDK interleave──>  /G100P_1/left_color/image_raw  30 fps
+                                 └  /G100P_1/depth/image_raw       30 fps
 ```
 
 `color` and `depth` come from **two adjacent sensor frames**, so
@@ -119,7 +158,7 @@ sensor-frame period (e.g. 20 ms) yields a stable match.
 
 #### Affected mode IDs
 
-In `launch/video_modes/G100P.yaml`, `mode_id` **1, 3, 5, 7–21** are
+In `launch/video_modes/G100P.yaml`, `mode_id` **1, 3, 5, 7–21, 56, 57** are
 interleave. The other modes capture color and depth simultaneously
 with matching stamps.
 
@@ -145,19 +184,21 @@ is suppressed by the per-model launches' default `log:=sdk`. Pass
 | Parameter | Default | Description |
 |---|---|---|
 | `camera_name` | `<MODEL>_1` | ROS namespace + frame-id prefix |
-| `mode_id` | `1` | Mode index in the per-model catalogue |
+| `mode_id` | `-1` | Mode index in the per-model catalogue; `-1` = auto (the per-link signature default for the negotiated USB speed) |
 | `dev_serial_number` | `""` | Bind by serial-number substring |
 | `usb_port` | `""` | Bind by USB topology, e.g. `2-3:1.0` |
-| `depth_minimum_mm` | `-1` | Near cutoff applied to `/depth_image` and `/pointcloud`; pixels closer than this are zeroed. `-1` = per-model default (G100+ 250, R77 200, G62 100) |
-| `depth_maximum_mm` | `-1` | Far cutoff applied to `/depth_image` and `/pointcloud`; pixels beyond this are zeroed. `-1` = per-model default (G100+ 1900, R77/G62 1500) |
+| `depth_near_mm` | `-1` | Near cutoff applied to `/depth/image_raw` and `/depth/points`; pixels closer than this are zeroed. `-1` = per-model default (G100+ 250, R77 200, G62 100) |
+| `depth_far_mm` | `-1` | Far cutoff applied to `/depth/image_raw` and `/depth/points`; pixels beyond this are zeroed. `-1` = per-model default (G100+ 1900, R77/G62 1500) |
 | `colored_pointcloud` | `false` | Publish XYZRGB PointCloud2 sampled from the latest left-color frame. Falls back to XYZ on depth-only modes |
 | `spatial_filter` | `false` | Enable the disparity-domain edge-aware IIR spatial filter (boolean toggle) |
 | `temporal_filter` | `false` | Enable the temporal filter, alpha-blend + persistence (boolean toggle, runtime-tunable) |
 | `hole_filling` | `0` | Z-domain hole fill mode. `0` = off, `1` = fill_from_left, `2` = farthest_from_around, `3` = nearest_from_around (integer, not boolean) |
 | `filter_profile` | `default` | Tuning profile name; resolves to `cfg/filter_profiles/<name>.yaml`. Seeds filter tuning values at startup |
-| `ir_intensity` | `-1` | `-1` = per-model default (G100+ / R77 = 3, G62 = 60); `0` = off; positive integer in the FW range (G100+ 0-9, R77 0-6, G62 0-96) to override |
+| `ir_value` | `-1` | `-1` = per-mode default: the model default (G100+ / R77 = 3, G62 = 60) when the mode has depth or the module is monochrome (G62 / R77), off for a color-only mode on a color sensor; `0` = off; positive integer in the FW range (G100+ 0-6, R77 0-6, G62 0-96) to override |
 | `log` | `sdk` (per-model) / `all` (generic) | Terminal output level. `all` = full RCLCPP + SDK output; `sdk` = suppress RCLCPP INFO/DEBUG but keep WARN/ERROR plus SDK printf; `close` = redirect everything to a per-process log file (terminal silent) |
+| `urdf` | `true` | Publish the camera model (mesh + mounting-hole frames) on `<camera_name>/robot_description` via a namespaced `robot_state_publisher`. Set `false` when the robot bringup already carries the camera in its own description |
 | `rviz` | `true` | Auto-open RViz |
+| `selfcal_enable` | `false` | Arm the optional self-calibration; `true` enables the `selfcal/run` action and `selfcal/commit` service (see [Self-Calibration](#self-calibration)). Launch-time only |
 
 Whether the color stream is split into `left_color` and `right_color`
 is determined by the selected video mode (the `split_lr` flag in
@@ -165,8 +206,8 @@ is determined by the selected video mode (the `split_lr` flag in
 
 ### Image Controls
 
-All eYs3D modules ship with `enable_auto_exposure` on,
-`enable_auto_white_balance` on, and `power_line_frequency` set to 60
+All eYs3D modules ship with `auto_exposure` on,
+`auto_white_balance` on, and `power_line_frequency` set to 60
 Hz; the driver inherits whatever the firmware boots with and only
 writes a value back when the operator explicitly overrides it, so
 settings tuned outside ROS persist across restarts. IR is the
@@ -176,12 +217,15 @@ projector off.
 Apply runtime overrides — no restart needed:
 
 ```bash
-ros2 param set /G100P_1/eys3d_camera ir_intensity         5
-ros2 param set /G100P_1/eys3d_camera enable_auto_exposure      false   # manual exposure
-ros2 param set /G100P_1/eys3d_camera exposure_time_step        -8
-ros2 param set /G100P_1/eys3d_camera enable_auto_white_balance false
+ros2 param set /G100P_1/eys3d_camera ir_value             5
+ros2 param set /G100P_1/eys3d_camera auto_exposure        false   # manual exposure
+ros2 param set /G100P_1/eys3d_camera exposure_time_step   -8
+ros2 param set /G100P_1/eys3d_camera auto_white_balance   false
 ros2 param set /G100P_1/eys3d_camera power_line_frequency 1       # 1 = 50 Hz, 2 = 60 Hz
 ```
+
+`exposure_time_step` takes a signed integer in **[-13, 3]** (log2 exposure
+register) and applies only while `auto_exposure` is `false`.
 
 ### Post-Processing Filters
 
@@ -195,13 +239,9 @@ independently — any combination is supported.
 | `hole_filling` | Launch only (`0` = off; `2` = recommended) |
 
 Tuning values (`alpha` / `delta` / `magnitude` / `holes_fill` /
-`persistence`) live in `cfg/filter_profiles/<name>.yaml`. The shipped
-`default.yaml` is a single conservative tuning that runs across all
-three modules. Authoring a profile is the recommended way to adapt
-the filter behaviour to a specific working envelope (working
-distance range, scene texture, motion characteristics) — copy
-`default.yaml`, edit fields, and load via `filter_profile:=<name>`.
-Absent fields fall back to the node's compiled defaults.
+`persistence`) live in `cfg/filter_profiles/<name>.yaml`. To author a
+profile, copy `default.yaml` and edit the fields; absent fields fall back
+to the node's compiled defaults.
 
 ```bash
 # Enable spatial + temporal with the default tuning profile
@@ -227,8 +267,10 @@ ros2 param set /G100P_1/eys3d_camera temporal_filter_persistence 3
 
 ### Runtime Stream Control
 
-Two services pause or stop the camera output without unloading the
-ROS node. Both control the color and depth streams together.
+Three services control the camera output without unloading the ROS node.
+`pause` and `standby` take a `std_srvs/srv/SetBool` and control the color and
+depth streams together; `hw_reset` takes a `std_srvs/srv/Empty` and power-cycles
+the camera over USB.
 
 ```bash
 # Stop publishing frames but keep the camera streaming on USB.
@@ -238,10 +280,17 @@ ros2 service call /G100P_1/pause   std_srvs/srv/SetBool "{data: true}"
 ros2 service call /G100P_1/pause   std_srvs/srv/SetBool "{data: false}"
 
 # Release the USB pipe entirely. The ROS node stays alive and its
-# topics stay advertised. Resume reopens the camera in roughly 300 ms.
+# topics stay advertised. Resume reopens the camera, which takes a few
+# seconds depending on the model.
 # Use to free USB bandwidth for another device.
 ros2 service call /G100P_1/standby std_srvs/srv/SetBool "{data: true}"
 ros2 service call /G100P_1/standby std_srvs/srv/SetBool "{data: false}"
+
+# Reset the camera over USB (re-enumerate the device). The node stops the
+# streams, issues the reset, and the watchdog reconnects automatically —
+# frames typically resume in ~12 s. Use to recover a wedged camera without
+# restarting the node.
+ros2 service call /G100P_1/hw_reset std_srvs/srv/Empty
 ```
 
 While Standby is in effect, the auto-recovery watchdog (next section)
@@ -251,20 +300,18 @@ The current control state is published on `/diagnostics` under the
 
 ### Hot-plug Auto-recovery
 
-The node runs a 1 Hz watchdog. If no color **and** no depth frames
-arrive for **3 consecutive seconds** (10 s at startup), the watchdog
-closes the device and enters a reconnect loop, polling the SDK every
-2 s. When the camera comes back the streams resume on the same
-topics — no `ros2 launch` restart required.
+The node runs a 1 Hz watchdog. Each stream is watched on its own: once a
+stream has delivered a frame, **3 consecutive seconds** of silence on that
+stream closes the device and enters a reconnect loop, polling the SDK every
+2 s. Depth wedging in firmware while color keeps flowing is therefore
+recovered. Before the first frame arrives the threshold is 10 s, which covers
+slow modes such as R77 at 7 fps. When the camera comes back the streams resume
+on the same topics — no `ros2 launch` restart required.
 
 ```
-[ERROR] watchdog: no frames for 3 s — declaring camera disconnected
+[ERROR] watchdog: depth stream silent for 3 s; declaring camera disconnected
 [INFO]  watchdog: reconnect succeeded after 2 attempt(s)
 ```
-
-Slow modes (e.g. R77 7 fps) are accommodated by the 10 s startup
-grace; once any frame has been observed, the 3 s steady-state
-threshold takes effect.
 
 ### Multiple Cameras
 
@@ -292,9 +339,9 @@ Each one ships with `usb_port` placeholders — edit them to match your
 wiring before launching:
 
 ```bash
-ros2 launch eys3d_camera examples/dual_G62.launch.py
-ros2 launch eys3d_camera examples/dual_G100P.launch.py
-ros2 launch eys3d_camera examples/G100P_plus_R77.launch.py
+ros2 launch eys3d_camera dual_G62.launch.py
+ros2 launch eys3d_camera dual_G100P.launch.py
+ros2 launch eys3d_camera G100P_plus_R77.launch.py
 ```
 
 The bundled multi-camera examples pre-select lighter `mode_id`
@@ -317,18 +364,37 @@ stream has both a sensor frame and a REP-103 `_optical_frame`.
 PointCloud2 carries `<camera_name>_points_frame` and is already in ROS
 base axes — no rotation needed.
 
-Mount `<camera_name>_link` under your robot's existing frame in URDF
-to integrate. Minimal skeleton (replace `parent_link`, the joint
-name, and the mount pose with values that match your platform):
+Each model ships a URDF/xacro description with a 3D mesh
+(`urdf/eys3d_<MODEL>.urdf.xacro` + `meshes/<MODEL>.dae`). `<name>_link`
+sits at the depth start point — centered between the two imagers, on
+the optical axis, Z' behind the camera front face (G100+ 6.75 mm,
+R77 4.8 mm, G62 3.1 mm). Instantiate the macro under your robot's
+existing frame with the physical mount pose:
 
 ```xml
-<joint name="g100p_mount" type="fixed">
-  <parent link="parent_link"/>
-  <child  link="G100P_1_link"/>
+<xacro:include filename="$(find eys3d_camera)/urdf/eys3d_G100P.urdf.xacro"/>
+<xacro:eys3d_G100P name="G100P_1" parent="parent_link">
   <origin xyz="0.10 0.00 0.05" rpy="0 0 0"/>
-</joint>
-<link name="G100P_1_link"/>
+</xacro:eys3d_G100P>
 ```
+
+For a standalone preview (`name` defaults to `<MODEL>_1`, matching the
+driver and the shipped rviz layouts):
+
+```bash
+ros2 launch eys3d_camera display_model.launch.py model:=G100P
+```
+
+Preview all three models side by side (no hardware needed):
+
+```bash
+ros2 launch eys3d_camera three_models.launch.py
+```
+
+Each description also carries the case mounting-hole frames
+(`<name>_tripod_frame` and `<name>_back/bottom_screw*_frame` as
+applicable, positions from the factory CAD) for aligning the model
+with the mechanical design.
 
 The driver publishes the camera TF tree once on `/tf_static` with
 `TRANSIENT_LOCAL` durability, so any subscriber that joins later
@@ -346,7 +412,7 @@ messages are delivered to same-container subscribers by pointer
 instead of through DDS.
 
 ```bash
-ros2 launch eys3d_camera examples/G100P_composable.launch.py \
+ros2 launch eys3d_camera G100P_composable.launch.py \
     use_intra_process_comms:=true
 ```
 
@@ -371,9 +437,10 @@ task carries the overall health summary:
 
 | `level` | `message` | Meaning |
 |---|---|---|
-| `OK` | `streaming OK` | Every enabled stream is delivering at least 50 % of its expected fps |
-| `WARN` | `one stream below 50% of expected fps` | One enabled stream is slow |
-| `ERROR` | `no frames flowing on enabled streams` | Both enabled streams below threshold (or both empty) |
+| `OK` | `streaming` | Every configured stream is delivering |
+| `OK` | `streaming (paused — publish gated by operator)` | `pause` is in effect |
+| `OK` | `standby (USB pipe closed by operator)` | `standby` is in effect |
+| `ERROR` | `no frames flowing on any configured stream` | Every configured stream is below half its expected rate |
 | `ERROR` | `camera disconnected; Linux device node not present` | USB lost; the watchdog will reconnect when the device returns |
 
 Per-task `values` (KeyValue pairs):
@@ -402,11 +469,14 @@ Per-task `values` (KeyValue pairs):
 | `decode_avg_ms` | (color only) Mean color decode time during the past second. Reported only when at least one frame was decoded in that period |
 | `decode_max_ms` | (color only) Longest color decode time observed so far. Reported only when at least one frame has been decoded |
 
+Their summary is `streaming`, `input rate below 50% of expected` (WARN),
+`not configured (D-only mode)`, or `standby`.
+
 **`pointcloud`** — reprojection + post-processing counters:
 
 | Key | Description |
 |---|---|
-| `compute_status` | `active` (a subscriber is pulling clouds), `idle (no /pointcloud subscriber)`, `idle (never run ; no subscriber since start)`, or `(disconnected — see device task)` |
+| `compute_status` | `active` (a subscriber is pulling clouds), `idle (no /depth/points subscriber)`, `idle (never run ; no subscriber since start)`, or `(disconnected — see device task)` |
 | `publish_fps` | Clouds published per second over the past second. Zero when no subscriber |
 | `compute_avg_ms` | Mean compute time per cloud during the past second (present when `active`) |
 | `compute_max_ms` | Longest compute time observed so far |
@@ -417,7 +487,7 @@ Per-task `values` (KeyValue pairs):
 
 | Key | Description |
 |---|---|
-| `temperature_c` | On-die thermal sensor (°C). `n/a (not supported on this model)` on modules without one |
+| `temperature_c` | On-die thermal sensor (°C). Present only when the module has the sensor and the read succeeds; otherwise the key is absent and the task summary carries the reason |
 
 The diagnostic message is only built and published when at least one
 subscriber is connected to `/diagnostics`; the hot-path atomic counters
@@ -446,6 +516,132 @@ ros2 run eys3d_camera perf_monitor --ns /G100P_1 --interval 0.5
 
 ---
 
+## Self-Calibration
+
+Optional in-stream self-calibration re-aligns the stereo pair to recover depth
+fill rate on a module whose calibration has drifted. It is built in by default
+(CMake `EYS3D_WITH_SELFCAL`) and enabled per launch with `selfcal_enable:=true`.
+
+```bash
+ros2 launch eys3d_camera G100P.launch.py selfcal_enable:=true
+```
+
+Run it with the camera **streaming a depth mode and pointed at a normal,
+textured scene at working distance** — the calibrator measures depth coverage,
+so it needs valid depth to work from. One `selfcal/run` action runs a whole
+session, with the bundled tuning applied automatically.
+
+```bash
+# Run one session (blocks until it converges, ~20-30 s, then a brief re-check;
+# --feedback streams phase / progress). auto_commit_shift_px < 0 keeps the result
+# live but never writes flash; >= 0 auto-commits a verified-better run once the cy
+# shift reaches that many pixels (see the table below).
+ros2 action send_goal /G100P_1/selfcal/run \
+  eys3d_camera_interfaces/action/SelfCal \
+  "{auto_commit_shift_px: 0.25}" --feedback
+
+# Persist a kept result to flash (only needed when auto_commit did not fire).
+# Check the response's `success` field — it is false if there is nothing kept.
+ros2 service call /G100P_1/selfcal/commit std_srvs/srv/Trigger
+```
+
+The run resolves itself when the search finishes, on the calibrator's outcome
+**plus a live A/B re-check** that measures depth fill-rate at the new vs. the
+pre-run alignment on the same scene (so the verdict reflects the real before/after,
+not a scene-dependent guess):
+
+- **verified better** — a `SUCCESS` the re-check confirms is live
+  (`applied: true`). If `auto_commit_shift_px` is set and `cy_shift_px` reaches
+  it, the run **commits** to flash (`committed: true`); otherwise it is **kept
+  live** but volatile — call `selfcal/commit` to keep it past a power-cycle.
+- **already optimal** (`NO_CHANGE`) — nothing is changed, applied, or written.
+  A normal, healthy result.
+- **worse / unverifiable / failed** — a result the re-check finds worse or cannot
+  confirm (e.g. the camera moved during the run), or an `INSUFFICIENT_INPUT` /
+  `TIMEOUT` / `FAILED` outcome — the camera is **rolled back** to its pre-run
+  alignment (`reverted: true`).
+
+`cy_shift_px` is the measured vertical shift, read straight from the hardware, and
+is the value the auto-commit gate uses. The step is fixed at **0.25 px** and the
+correction is capped at **5.0 px**, so it is always one of
+`0.25, 0.50, … 5.00` (or `0`).
+`auto_commit_shift_px` is a threshold — it accepts any value, but only the step
+boundaries change behaviour and a value between steps rounds up (`0.3` acts like
+`0.5`):
+
+| `auto_commit_shift_px` | Effect |
+| --- | --- |
+| `-1` (default) | never auto-commit — review, then commit manually. The value used when the goal omits the field |
+| `0.25` | commit on any real move (≥ 1 step) — **recommended** |
+| `0.50`, `0.75`, … up to `5.00` | require a larger shift |
+| `> 5.0` | never fires (the shift cannot exceed the cap) |
+
+### Action Feedback
+
+Streamed continuously while the run is in progress, when the goal is sent with
+`--feedback`:
+
+| Field | Meaning |
+| --- | --- |
+| `phase` | `INITIAL_SEARCH` / `REFINEMENT` / `RECHECK` / `COMPLETED` |
+| `progress` | search progress, `0.0`–`1.0` |
+| `processed_frames` | depth frames fed to the calibrator so far |
+| `valid_ratio_latest` | fill-rate of the latest frame (populated once a result exists) |
+
+### Action Result
+
+The goal aborts when the session could not run, could not reach an answer, or
+could not undo a change it rejected; a deliberate revert succeeds. `outcome`
+carries the detail either way.
+
+Delivered once when the run resolves — the record of what the session measured
+and what it left on the camera:
+
+| Field | Meaning |
+| --- | --- |
+| `outcome` | `SUCCESS` / `NO_CHANGE` / `INSUFFICIENT_INPUT` (not enough valid depth in the scene) / `TIMEOUT` (did not converge in time) / `FAILED` |
+| `cy_shift_px` | measured vertical cy shift in pixels — the auto-commit gate |
+| `recheck_verdict` | A/B re-check: `improved` / `worse` / `inconclusive` / `skipped` |
+| `recheck_ratio_before` / `recheck_ratio_after` | fill-rate at the pre-run / converged alignment during the re-check |
+| `applied` | a correction is live in the registers |
+| `reverted` | rolled back to the pre-run calibration |
+| `committed` | written to the user calibration slot |
+| `message` | human-readable summary of the outcome |
+| `correction_level`, `valid_ratio_first` / `_latest` / `_delta` | diagnostics only (never gate the commit) |
+
+The whole session runs in-stream: depth keeps publishing and any post-processing
+filters keep running — the run never restarts the stream. During the search the
+depth quality visibly fluctuates as the calibrator probes alignments, then
+settles. A session **cannot be interrupted** (cancels are rejected, and the
+control setters plus `pause` / `standby` / `hw_reset` decline) — it is short and
+auto-reverts if the result is worse, so there is nothing to interrupt.
+
+`commit` is the only step that writes flash; the factory calibration is kept as
+a backup and never overwritten. A kept-but-not-committed result lives only in
+the camera's registers, so a power-cycle or `~/hw_reset` clears it back to the
+stored calibration. This makes "calibrate live, never write flash" a safe
+default workflow — run it whenever the robot is docked and still.
+
+A couple of things worth knowing:
+
+- **Repeated runs can stack.** Re-running `selfcal/run` before a commit or
+  power-cycle builds on the last kept result, not on flash. Commit or
+  power-cycle first for a clean baseline.
+- **Not eligible or already running → rejected, not failed.** A module that
+  does not support self-calibration, and a second concurrent run, are both
+  refused outright — `ros2 action send_goal` reports "Goal was rejected" (no
+  `Result`); check the node log for the reason.
+
+**One session per process.** The calibrator binds the camera handle in a process
+global, so cameras sharing a process — several drivers in one
+`ComposableNodeContainer` — calibrate one at a time; a second `selfcal/run` is
+rejected on the node log until the first resolves. Cameras launched as separate
+processes are unaffected. Intra-process communication is otherwise orthogonal:
+the calibrator takes its own copy of the depth frame, so `use_intra_process_comms`
+delivery is unchanged during a run.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Resolution |
@@ -459,21 +655,15 @@ ros2 run eys3d_camera perf_monitor --ns /G100P_1 --interval 0.5
 ### Subscribers receive fewer frames than the driver publishes
 
 If `perf_monitor` or `ros2 topic hz` reports Rx < Pub while
-`/diagnostics` shows `dropped = 0`, the loss is on the DDS transport,
+`/diagnostics` shows `input_dropped = 0`, the loss is on the DDS transport,
 not in the driver.
 
-Each image frame in the supported modes is larger than the kernel UDP
-socket and IP fragment reassembly budget can absorb in a single burst
-(an `rgb8` 1280×720 frame is ~2.7 MB; a typical point cloud is up to
-~11 MB). The same symptom shows up in two configurations — both are
-the same underlying mechanism (kernel-side buffer overflow), seen from
-different ends:
-
-- **Fast x86 hosts** emit each frame as a tight burst of UDP fragments
-  that overflows the receive socket / reassembly queue before the
-  receiver thread drains it.
-- **Resource-constrained ARM hosts** drain the same kernel buffer too
-  slowly, so the buffer fills sooner, with the same outcome.
+Each image frame in the supported modes is larger than the kernel UDP socket
+and IP fragment reassembly budget can absorb in one burst (an `rgb8` 1280×720
+frame is ~2.7 MB; a point cloud up to ~11 MB), so the kernel-side buffer
+overflows — whether because a fast x86 host emits the fragments faster than
+the receiver drains them, or because a constrained ARM host drains them too
+slowly.
 
 The package ships an opt-in helper that switches FastRTPS to a 32 MB
 shared-memory segment, eliminating UDP fragmentation for any same-host

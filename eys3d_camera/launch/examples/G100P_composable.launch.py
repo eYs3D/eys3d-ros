@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """eys3d_camera G100+ composable launch.
 
-Loads the G100+ camera in its default mode (mode 1: L'+D 1280x720 at
-30 fps interleaved) into a ComposableNodeContainer. The argument
+Loads the G100+ camera in mode 1 (L'+D 1280x720 at 30 fps interleaved)
+into a ComposableNodeContainer. The argument
 surface covers the settings a deployment typically overrides
 (camera identity, USB binding, intra-process comms) and
 accepts a `params_file` so a deployment's full driver configuration
@@ -18,7 +18,7 @@ Topic delivery summary:
   * /tf_static is always published once with TRANSIENT_LOCAL
     durability and intra-process delivery explicitly disabled on
     that publisher, so it works on every supported ROS 2 distro.
-  * /<camera_name>/{left_color, depth_image, pointcloud,
+  * /<camera_name>/{left_color/image_raw, depth/image_raw, depth/points,
     camera_info, diagnostics} use VOLATILE durability and follow
     the node-level IPC setting; with intra-process comms enabled
     the publishes hand a unique_ptr to same-container subscribers.
@@ -38,9 +38,11 @@ import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
-from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import ComposableNodeContainer
+from launch.conditions import IfCondition
+from launch.substitutions import Command, LaunchConfiguration
+from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 # Camera identity baked into this launch. Switching to a different
@@ -89,6 +91,10 @@ def _build(context):
         'dev_serial_number':  LaunchConfiguration('dev_serial_number'),
         'usb_port':           LaunchConfiguration('usb_port'),
         'dm_quality_cfg_dir': dm_quality_cfg_dir,
+        # Declared bool on the node; state the type so the composable
+        # dispatch does not hand the driver a string.
+        'selfcal_enable':     ParameterValue(
+            LaunchConfiguration('selfcal_enable'), value_type=bool),
     }
 
     ipc = LaunchConfiguration('use_intra_process_comms')
@@ -116,7 +122,26 @@ def _build(context):
         composable_node_descriptions=descriptions,
         output='screen',
     )
-    return [container]
+
+    # Camera model publisher, namespaced by camera_name so the topic never
+    # clobbers another robot's /robot_description. robot_state_publisher is
+    # not a component, so it runs beside the container rather than inside it.
+    urdf_xacro = os.path.join(pkg_share, 'urdf', 'eys3d_camera.urdf.xacro')
+    rsp_node = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        namespace=LaunchConfiguration('camera_name'),
+        output='log',
+        condition=IfCondition(LaunchConfiguration('urdf')),
+        parameters=[{
+            'robot_description': ParameterValue(Command([
+                'xacro ', urdf_xacro,
+                ' model:=', MODEL,
+                ' camera_name:=', LaunchConfiguration('camera_name'),
+            ]), value_type=str),
+        }],
+    )
+    return [container, rsp_node]
 
 
 def generate_launch_description():
@@ -146,10 +171,23 @@ def generate_launch_description():
                         'same container receive a unique_ptr instead of '
                         'a deserialised copy.'),
         DeclareLaunchArgument(
+            'selfcal_enable', default_value='false',
+            description='Enable in-stream self-calibration, exposing the '
+                        '<camera_name>/selfcal/run action and '
+                        '<camera_name>/selfcal/commit service. Only one '
+                        'session may run per process, so cameras sharing '
+                        'this container calibrate one at a time.'),
+        DeclareLaunchArgument(
             'params_file', default_value='',
             description='Optional YAML file appended to the CameraNode '
                         'parameters list. Applied after the filter '
                         'profile and the explicit launch arguments; '
                         'later entries override earlier ones.'),
+        DeclareLaunchArgument(
+            'urdf', default_value='true',
+            description='Publish the camera model to '
+                        '<camera_name>/robot_description via '
+                        'robot_state_publisher. Set false for the driver '
+                        'and container alone.'),
         OpaqueFunction(function=_build),
     ])

@@ -1,4 +1,8 @@
 #include "eys3d_camera/espdi_device.hpp"
+
+#include "eys3d_camera/video_modes.hpp"
+
+#include "espdi_error.hpp"
 #include "register_settings.hpp"
 #include "spatial_filter.hpp"
 #include "hole_filling.hpp"
@@ -14,15 +18,16 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
-#include <filesystem>
 #include <iostream>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <regex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -39,12 +44,20 @@ namespace {
 // intensity against the firmware-reported ceiling.
 constexpr uint16_t kFwRegIrMax = 0xE2;
 
-// Scope APC_Init's SIGINT handler to open(). APC_Init installs an
-// exit()-on-delivery handler that would otherwise pre-empt
-// rclcpp::shutdown() and skip every C++ destructor; the guard
-// captures whatever handler is in place on entry and restores it on
-// exit so Ctrl-C drives rclcpp::spin() to return normally. SIGTERM
-// is carried for parity.
+// Serializes device open / probe across every EspdiDevice in the process. The
+// eSPDI SDK keeps per-process device bookkeeping, so two cameras setting up at
+// once can interfere. A timed_mutex bounds the wait: a camera stuck in a
+// mid-open SDK call (e.g. unplugged during APC_OpenDevice2) cannot block the
+// others forever — they time out and report instead.
+std::timed_mutex& device_setup_lock() {
+    static std::timed_mutex m;
+    return m;
+}
+constexpr int kSetupTurnTimeoutMs = 120000;
+
+// Save and restore the process SIGINT/SIGTERM handlers across a scope.
+// APC_Init installs its own exit()-on-delivery handler; this keeps it from
+// outliving the open()/probe span.
 class SignalHandlerGuard {
 public:
     SignalHandlerGuard() {
@@ -62,88 +75,59 @@ private:
     struct sigaction sigterm_{};
 };
 
-// Per-PID IR default level applied at open(). G62 ships with a different
-// IR LED part whose FW IR-MAX defaults to 96, so its "comfortable" level
-// is higher; G100+/G100+i/R77 use level 3. The FW range is read back at
-// open and logged.
-int default_ir_level_for_pid(unsigned short pid) {
-    switch (pid) {
-    case APC_PID_8081:  return 60;   // G62
-    case APC_PID_80362: /* G100+ */  [[fallthrough]];
-    case APC_PID_IRIS:  /* G100+i */ [[fallthrough]];
-    case APC_PID_8072:  /* R77 */    [[fallthrough]];
-    default:            return 3;
-    }
-}
+// Per-model constants (IR default, depth range, PID, mono) come from the
+// video-mode catalogue header via DeviceConfig — see
+// launch/video_modes/<MODEL>.yaml.
 
-// Per-PID working depth range used as the default PointCloud clip. Caller's
-// launch parameter > 0 overrides this.
-struct DepthRange {
-    int near_mm;
-    int far_mm;
-};
-
-DepthRange depth_range_for_pid(unsigned short pid) {
-    switch (pid) {
-    case APC_PID_80362: return {250, 1900};   // G100+
-    case APC_PID_IRIS:  return {250, 1900};   // G100+i
-    case APC_PID_8072:  return {200, 1500};   // R77
-    case APC_PID_8081:  return {100, 1500};   // G62
-    default:            return {250, 1900};
-    }
-}
-
-// Expected USB PID for the camera model token (the launch `model` parameter).
-// Returns 0 for unknown models — the open path treats 0 as "skip the PID
-// check" so untargeted models still work, but the supported lineup must hit
-// one of the cases below.
-unsigned short expected_pid_for_model(const std::string& model) {
-    if (model == "G100P")  return APC_PID_80362;   // 0x0181
-    if (model == "G100Pi") return APC_PID_IRIS;    // 0x0184
-    if (model == "R77")    return APC_PID_8072;    // 0x0180
-    if (model == "G62")    return APC_PID_8081;    // 0x0183
-    return 0;
-}
+// video_modes.hpp is installed and eSPDI_def.h is not, so color_is_rectified()
+// carries these as literals. Pinned here so a renumbering breaks the build.
+static_assert(APC_DEPTH_DATA_INTERLEAVE_MODE_OFFSET == 16 &&
+              APC_DEPTH_DATA_SCALE_DOWN_MODE_OFFSET == 32,
+              "APC_DEPTH_DATA_* offsets moved; revisit color_is_rectified()");
+static_assert(APC_DEPTH_DATA_8_BITS == 1 && APC_DEPTH_DATA_14_BITS == 2 &&
+              APC_DEPTH_DATA_8_BITS_x80 == 3 && APC_DEPTH_DATA_11_BITS == 4 &&
+              APC_DEPTH_DATA_OFF_RECTIFY == 5 &&
+              APC_DEPTH_DATA_14_BITS_COMBINED_RECTIFY == 11 &&
+              APC_DEPTH_DATA_11_BITS_COMBINED_RECTIFY == 13,
+              "APC_DEPTH_DATA_* rectify codes moved; revisit color_is_rectified()");
 
 // Backoff applied on APC_DEVICE_TIMEOUT to avoid busy-spinning.
 constexpr int kTimeoutBackoffUs = 100;
+
+// Backoff on any other SDK error. A persistent one -- APC_OPEN_DEVICE_FAIL
+// repeats on every call -- would otherwise spin a core until the reconnect.
+constexpr int kErrorBackoffUs = 2000;
+
+// The firmware stamps a 16-byte serial-number watermark over the first
+// 8 pixels of depth row 0. Those pixels carry no distance: every publish
+// path zeroes them and reprojection skips the same columns, so the
+// raster and the cloud agree on which pixels exist.
+constexpr int kSerialSkipPixels = 8;
 
 // Window after start() during which the per-stream subscriber gates are
 // bypassed. DDS discovery can take several hundred milliseconds; this
 // grace period lets late subscribers receive the initial frames.
 constexpr int kGatePassThroughMs = 3000;
 
-// Cached logger handle. rclcpp::get_logger() hashes the name and
-// allocates an internal shared_ptr on every call, which the THROTTLE
-// macros invoke unconditionally; at 30 fps × three fetch loops this
-// is measurable. The function-local static is constructed once on first
-// use and returned by reference thereafter.
+// Cached logger: rclcpp::get_logger() hashes the name and allocates on
+// every call, and the THROTTLE macros invoke it unconditionally.
 const rclcpp::Logger& logger() {
     static const rclcpp::Logger kLogger = rclcpp::get_logger("EspdiDevice");
     return kLogger;
 }
 
 // One-shot stdout marker emitted on the first frame from either fetch
-// thread so launch tooling can detect pipeline readiness. The marker
-// and the follow-up tip are emitted in a single std::cout write so
-// concurrent wakeups from the two fetch threads cannot interleave on
-// stdout.
+// thread so launch tooling can detect pipeline readiness. Written in a
+// single std::cout call so concurrent wakeups from the two fetch threads
+// cannot interleave on stdout.
 void emit_ready_marker() {
-    std::cout
-        << "EYS3D_CAMERA_READY\n"
-           "[eys3d_camera] streaming. To see full RCLCPP logs "
-           "append `log:=all` to the launch command "
-           "(per-model launches default to `log:=sdk`)."
-        << std::endl;
+    std::cout << "EYS3D_CAMERA_READY\n[eys3d_camera] streaming." << std::endl;
     std::cout.flush();
 }
 
-// Shared clock for RCLCPP_*_THROTTLE in the hot fetch loops. A fresh
-// `rclcpp::Clock::make_shared()` would allocate a shared_ptr on every
-// macro expansion (the THROTTLE macro evaluates its clock argument
-// unconditionally to decide whether to emit) — at 30+ fps across three
-// fetch loops this becomes measurable overhead. A single static instance
-// avoids the per-iteration allocation.
+// Shared clock for RCLCPP_*_THROTTLE in the fetch loops. Static, not a
+// per-call make_shared: the THROTTLE macro evaluates its clock argument on
+// every expansion.
 rclcpp::Clock& throttle_clock() {
     static rclcpp::Clock c{RCL_STEADY_TIME};
     return c;
@@ -156,12 +140,9 @@ size_t color_raw_buffer_bytes(int w, int h) {
     return static_cast<size_t>(w) * static_cast<size_t>(h) * 2;
 }
 
-// Final published image is always rgb8 (3 bytes/pixel) for cross-vendor
-// portability — RViz, image_pipeline, cv_bridge, depth_image_proc and
-// the rest of the perception stack all consume rgb8 natively. Grayscale
-// sensors (G62) and grayscale-ISP outputs (R77) flow through the same
-// path: turbojpeg replicates Y → R=G=B at decode time, and the YUYV
-// converter falls out to R=G=B=Y when chroma is neutral (U=V=128).
+// The published image is always rgb8 (3 bytes/pixel), the encoding the
+// perception stack consumes natively. Monochrome modules (G62 / R77)
+// decode to one gray plane and replicate it to exact-gray rgb8.
 size_t color_rgb8_bytes(int w, int h) {
     return static_cast<size_t>(w) * static_cast<size_t>(h) * 3;
 }
@@ -173,6 +154,17 @@ size_t color_rgb8_bytes(int w, int h) {
 using simd::yuyv_to_rgb8;
 
 
+// APC_GetSerialNumber returns UTF-16 LE: two bytes per character, low byte
+// first. eYs3D serials are ASCII, so every even index is the character.
+// sn_len is a byte count and includes the terminating NUL on some modules.
+std::string decode_serial(const unsigned char* buf, int sn_len, size_t buf_size) {
+    const int chars = std::min(sn_len / 2, static_cast<int>(buf_size / 2));
+    std::string out(static_cast<size_t>(std::max(chars, 0)), '\0');
+    for (int j = 0; j < chars; ++j) out[j] = static_cast<char>(buf[j * 2]);
+    while (!out.empty() && out.back() == '\0') out.pop_back();
+    return out;
+}
+
 // Resolve "/dev/videoN" to its USB topology path ("2-3:1.0") via
 // /sys/class/video4linux. Returns empty string on non-USB devices or
 // sysfs failures. Stable across reboots; matches udev and lsusb output.
@@ -181,36 +173,47 @@ std::string resolve_usb_port(const std::string& v4l2_path) {
     if (v4l2_path.compare(0, dev_prefix.size(), dev_prefix) != 0) return {};
     const std::string vname = v4l2_path.substr(5);  // "video2"
     const std::string sysfs_link = "/sys/class/video4linux/" + vname + "/device";
-    std::error_code ec;
-    auto real = std::filesystem::canonical(sysfs_link, ec);
-    if (ec) return {};
 
-    // Iterate sysfs path components from deepest to root; return the first that
-    // matches the USB interface pattern. Pattern allows hubs ("2-1.4.2:1.0").
+    // Not std::filesystem::canonical(): <filesystem> needs GCC 8 and the
+    // bundled eSPDI SDK is built with 7.5.
+    std::unique_ptr<char, decltype(&std::free)> resolved(
+        ::realpath(sysfs_link.c_str(), nullptr), &std::free);
+    if (!resolved) return {};
+
+    // Split the resolved path into its components, deepest last.
+    std::vector<std::string> parts;
+    {
+        const std::string real(resolved.get());
+        std::string::size_type start = 0;
+        while (start <= real.size()) {
+            const auto slash = real.find('/', start);
+            const auto end = (slash == std::string::npos) ? real.size() : slash;
+            if (end > start) parts.emplace_back(real, start, end - start);
+            if (slash == std::string::npos) break;
+            start = slash + 1;
+        }
+    }
+
+    // Walk the components from deepest to root; return the first that matches
+    // the USB interface pattern. Pattern allows hubs ("2-1.4.2:1.0").
     static const std::regex kUsbIfacePattern(R"(^\d+-\d+(?:\.\d+)*:\d+\.\d+$)");
     static const std::regex kUsbDevicePattern(R"(^\d+-\d+(?:\.\d+)*$)");
     // Prefer the more specific :config.interface form, fall back to the device
     // form. Two passes keep priority deterministic.
-    for (auto it = real.end(); it != real.begin(); ) {
-        --it;
-        const std::string s = it->string();
-        if (std::regex_match(s, kUsbIfacePattern)) return s;
+    for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+        if (std::regex_match(*it, kUsbIfacePattern)) return *it;
     }
-    for (auto it = real.end(); it != real.begin(); ) {
-        --it;
-        const std::string s = it->string();
-        if (std::regex_match(s, kUsbDevicePattern)) return s;
+    for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+        if (std::regex_match(*it, kUsbDevicePattern)) return *it;
     }
     return {};
 }
 
-// Depth buffer size in bytes. Most depth data types pack two bytes per pixel.
-// 8-bit raw variants double the row width per SDK convention.
-size_t depth_buffer_bytes(int w, int h, int depth_data_type) {
-    const int base = depth_data_type % APC_DEPTH_DATA_INTERLEAVE_MODE_OFFSET;
-    if (base == APC_DEPTH_DATA_8_BITS || base == APC_DEPTH_DATA_8_BITS_RAW) {
-        return static_cast<size_t>(w) * 2 * static_cast<size_t>(h) * 2;
-    }
+// Depth buffer size in bytes. Every depth data type any supported eYs3D
+// module produces is 2 bytes/pixel, and the SDK sizes its callback buffer at
+// w*h*2 regardless of type; a frame that does not match is dropped by
+// ingest_depth rather than reinterpreted.
+size_t depth_buffer_bytes(int w, int h) {
     return static_cast<size_t>(w) * static_cast<size_t>(h) * 2;
 }
 }  // namespace
@@ -249,8 +252,8 @@ struct EspdiDevice::Impl {
     Calibration calib;
     eSPCtrl_RectLogData cached_rect{};
     bool cached_rect_valid = false;
-    float max_near_mm = 0.0f;
-    float max_far_mm  = 0.0f;
+    float depth_near_mm = 0.0f;
+    float depth_far_mm  = 0.0f;
 
     // Spatial filter state resolved at open(); ZD table cached at the
     // same point. pc_q4_buf and pc_mm_buf are sized once at pc_thread
@@ -281,6 +284,22 @@ struct EspdiDevice::Impl {
     void* handle = nullptr;
     DEVSELINFO sel{};
     DEVINFORMATION dev_info{};
+
+    // G2/G1 flash-bank offset (0 or 5) from FW register 0xF6; added to zd_index
+    // for every calibration read. Resolved in open().
+    int calib_bank_offset = 0;
+
+    // Optional self-calibration session bound to `handle`: created in open() when
+    // cfg.selfcal_enable is set, fed by depth_fetch, reset in close() before the
+    // handle is released. Null otherwise; thread-safety in SelfCalManager.
+    std::unique_ptr<SelfCalManager> selfcal_;
+    // Pre-session snapshot of the cy_R register (the only register a cy session
+    // dithers), taken by start_selfcal so a worse or abandoned run can be rolled
+    // back. Valid = a session is holding it and has not yet been resolved
+    // (reverted / kept / committed); close() rolls back if still valid.
+    unsigned short cy_snapshot_lo = 0;
+    unsigned short cy_snapshot_hi = 0;
+    bool cy_snapshot_valid = false;
     // Diagnostics + service reads run on the rclcpp executor; lifecycle
     // writes run on the watchdog timer or a service callback. Atomic to
     // avoid torn reads of these scalars on a multi-threaded executor.
@@ -288,7 +307,7 @@ struct EspdiDevice::Impl {
 
     int ir_max_fw = 0;
     bool ir_range_valid = false;
-    int ir_default_level = 3;
+    int ir_default_level = 0;  // mode-resolved at open()
     LatestDepth latest;
     LatestColor latest_color;
     bool colored_pointcloud = false;
@@ -308,6 +327,10 @@ struct EspdiDevice::Impl {
     // a released SDK handle.
     std::thread dm_quality_worker;
     std::atomic<bool> dm_quality_worker_running{false};
+    // Guards dm_quality_worker and the opened/handle check in
+    // apply_dm_quality_register_setting_async(). Lock order: lifecycle_mtx
+    // first (this one is never held across a fetch-thread join).
+    std::mutex dm_quality_mtx;
 
     // Serialises stop() and standby() so a service-thread close/reopen
     // cannot race with destruction. Also held by open() and by
@@ -321,13 +344,6 @@ struct EspdiDevice::Impl {
     std::mutex sdk_mtx;
 
     std::atomic<bool> running{false};
-    // Runtime stream control. Active = normal; Paused = SDK threads still
-    // running but every callback dispatch drops the frame at the top of the
-    // iteration (CPU near zero, resume on next frame); Standby = USB pipe
-    // closed via APC_CloseDevice and fetch threads joined (zero USB traffic,
-    // resume in ~200-400 ms). Both controls toggle the colour + depth pair
-    // together — per-stream toggling is intentionally not supported.
-    //
     // streams_present mirrors which of (color, depth) the *current* open()
     // configuration is delivering. Set once by open() based on the supplied
     // callbacks; never modified by pause / standby. The fetch threads read
@@ -342,24 +358,21 @@ struct EspdiDevice::Impl {
     // standby(false) reads this to land in the right post-resume state.
     std::atomic<bool> pause_pending{false};
 
-    // Health counters (atomic, single-writer / single-reader race-free).
-    // Read by CameraNode's 1 Hz diagnostics timer; reset only at open(),
-    // never touched at runtime so cumulative since open is well-defined.
-    //
-    // input_total ticks once per successful SDK frame (camera-side rate).
-    // publish_total ticks once per frame that survives the subscriber
-    // gate and reaches the publish callback (topic-side rate).
+    // Health counters (atomic, single-writer / single-reader). Reset only at
+    // open(), so they are cumulative since open. input_total ticks once per
+    // successful SDK frame; publish_total once per frame that survives the
+    // subscriber gate and reaches the publish callback.
     std::atomic<uint64_t> color_input_total{0};
     std::atomic<uint64_t> depth_input_total{0};
     std::atomic<uint64_t> color_publish_total{0};
     std::atomic<uint64_t> depth_publish_total{0};
     // Frames lost in the USB / SDK layer (detected as a forward gap in
-    // the FW serial-number sequence after the interleave parity filter).
+    // the FW frame-number sequence after the interleave parity filter).
     std::atomic<uint64_t> color_input_dropped{0};
     std::atomic<uint64_t> depth_input_dropped{0};
-    // Last accepted SN per stream. -1 = "first frame after spawn".
-    std::atomic<int> last_color_sn{-1};
-    std::atomic<int> last_depth_sn{-1};
+    // Last accepted frame number per stream. -1 = first frame after spawn.
+    std::atomic<int> last_color_frame{-1};
+    std::atomic<int> last_depth_frame{-1};
     // Color decode timing; only ticks on frames that are actually
     // decoded (a subscriber is present, or the startup grace window
     // is still active).
@@ -415,7 +428,97 @@ EspdiDevice::~EspdiDevice() {
     RCLCPP_INFO(logger(), "~EspdiDevice() done");
 }
 
+std::optional<int> EspdiDevice::probe_usb_type(const DeviceConfig& cfg) {
+    // Uses a throwaway handle; the selection precedence below mirrors open()
+    // so the probe reports the link of the device open() will bind.
+    //
+    // Take the process-wide setup turn (bounded) — this probe does its own
+    // APC_Init/enumeration and must serialize with open()s of other cameras.
+    std::unique_lock<std::timed_mutex> setup_lk(
+        device_setup_lock(), std::chrono::milliseconds(kSetupTurnTimeoutMs));
+    if (!setup_lk.owns_lock()) {
+        RCLCPP_ERROR(logger(),
+                     "probe_usb_type(): timed out waiting for the device-setup turn");
+        return std::nullopt;
+    }
+    // Scope the APC signal handlers to the APC_Init..APC_Release span, as
+    // open() does (see SignalHandlerGuard). The signature-auto default
+    // (mode_id=-1) runs this probe on every launch, so an unguarded APC_Init
+    // would leave its handler installed afterward.
+    SignalHandlerGuard signal_guard;
+    void* handle = nullptr;
+    if (APC_Init(&handle, /*bIsLogEnabled=*/false) != APC_OK || handle == nullptr)
+        return std::nullopt;
+    const int dev_count = APC_GetDeviceNumber(handle);
+    if (dev_count <= 0) { APC_Release(&handle); return std::nullopt; }
+
+    struct DevEnum { std::string sn, node, port; unsigned short pid = 0; };
+    auto enumerate = [&](int i) {
+        DEVSELINFO dev_sel{i};
+        DEVINFORMATION info{};
+        unsigned char sn_buf[256] = {0};
+        int sn_len = 0;
+        DevEnum d;
+        if (APC_GetSerialNumber(handle, &dev_sel, sn_buf, sizeof(sn_buf), &sn_len) == APC_OK
+            && sn_len > 0) {
+            d.sn = decode_serial(sn_buf, sn_len, sizeof(sn_buf));
+        }
+        // Same transient-failure retry as open(): a zeroed descriptor empties
+        // usb_port and drops the PID, breaking the match below.
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            if (APC_GetDeviceInfo(handle, &dev_sel, &info) == APC_OK) {
+                if (info.strDevName) d.node.assign(info.strDevName);
+                d.pid = info.wPID;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        d.port = resolve_usb_port(d.node);
+        return d;
+    };
+
+    int idx = -1;
+    if (!cfg.serial_number.empty() || !cfg.usb_port.empty()) {
+        for (int i = 0; i < dev_count; ++i) {
+            const auto d = enumerate(i);
+            const bool sn_ok  = cfg.serial_number.empty() ||
+                                d.sn.find(cfg.serial_number) != std::string::npos;
+            const bool bus_ok = cfg.usb_port.empty() ||
+                                (!d.port.empty() && d.port.find(cfg.usb_port) != std::string::npos);
+            if (sn_ok && bus_ok) { idx = i; break; }
+        }
+    } else if (cfg.expected_pid != 0) {
+        for (int i = 0; i < dev_count; ++i) {
+            if (enumerate(i).pid == cfg.expected_pid) { idx = i; break; }
+        }
+    } else {
+        idx = 0;
+    }
+    if (idx < 0) { APC_Release(&handle); return std::nullopt; }
+
+    DEVSELINFO sel{idx};
+    USB_PORT_TYPE port_type = USB_PORT_TYPE_UNKNOW;
+    const int rc = APC_GetDevicePortType(handle, &sel, &port_type);
+    APC_Release(&handle);
+    if (rc != APC_OK) return std::nullopt;
+    if (port_type == USB_PORT_TYPE_3_0) return 3;
+    if (port_type == USB_PORT_TYPE_2_0) return 2;
+    return std::nullopt;
+}
+
 bool EspdiDevice::open(const DeviceConfig& cfg) {
+    // Take the process-wide setup turn (bounded) before anything else, so a
+    // concurrent open of another camera in the same process is serialized and a
+    // stuck one cannot block this open forever. Outer to lifecycle_mtx.
+    std::unique_lock<std::timed_mutex> setup_lk(
+        device_setup_lock(), std::chrono::milliseconds(kSetupTurnTimeoutMs));
+    if (!setup_lk.owns_lock()) {
+        RCLCPP_ERROR(logger(),
+                     "open(): timed out after %d ms waiting for the device-setup "
+                     "turn; another camera may be stuck mid-open",
+                     kSetupTurnTimeoutMs);
+        return false;
+    }
     // Hold lifecycle_mtx for the duration of the open sequence so a
     // concurrent stop() / close() / standby() cannot run
     // partway through APC_Init -> APC_OpenDevice2 -> ZD-table load.
@@ -425,7 +528,13 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
     SignalHandlerGuard signal_guard;
     int ret = APC_Init(&impl_->handle, /*bIsLogEnabled=*/false);
     if (ret != APC_OK || impl_->handle == nullptr) {
-        RCLCPP_ERROR(logger(), "APC_Init failed (%d)", ret);
+        RCLCPP_ERROR(logger(), "APC_Init failed: %s", espdi_strerror(ret).c_str());
+        // APC_Init writes the context before it can fail, so a failed init
+        // still owns one.
+        if (impl_->handle != nullptr) {
+            APC_Release(&impl_->handle);
+            impl_->handle = nullptr;
+        }
         return false;
     }
 
@@ -434,81 +543,75 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
         RCLCPP_ERROR(logger(),
                      "APC_GetDeviceNumber returned %d ; no cameras detected", dev_count);
         APC_Release(&impl_->handle);
+        impl_->handle = nullptr;
         return false;
     }
     RCLCPP_INFO(logger(), "APC found %d device(s)", dev_count);
 
-    // Device selection precedence:
-    //   1. dev_serial_number substring match (printed on the module label).
-    //   2. usb_port substring match against the V4L2 device's USB topology
-    //      path (e.g. "2-3:1.0"), resolved via /sys/class/video4linux. Stable
-    //      across reboots and plug order — suitable for production wiring.
-    //   3. PID match against the launch `model` token. With multiple cameras
-    //      attached this is what stops two launches from grabbing the same
-    //      physical device.
-    //   4. Index 0 only if expected_pid is 0 (i.e. unknown model).
-    // The final chosen index's PID is re-validated against `model` below;
-    // any mismatch hard-fails the open.
+    // Device selection precedence: dev_serial_number, then usb_port (the USB
+    // topology path from /sys/class/video4linux), then a PID match against the
+    // launch `model`, then index 0 only when expected_pid is 0. The chosen
+    // index's PID is re-validated against `model` below; a mismatch fails the
+    // open.
     int chosen_index = -1;
     struct DevEnum {
         std::string serial_number;
-        std::string v4l2;     // /dev/videoN as reported by the SDK
+        std::string dev_node; // /dev/videoN as reported by the SDK
         std::string usb_port; // sysfs-resolved, e.g. "2-3:1.0"
         unsigned short pid = 0;
     };
     auto enumerate = [&](int i) {
-        DEVSELINFO tmp{i};
+        DEVSELINFO dev_sel{i};
         DEVINFORMATION info{};
-        // APC_GetSerialNumber returns a UTF-16 LE string: each character is 2
-        // bytes (low byte then high byte). eYs3D serial numbers are ASCII so
-        // the high byte is always zero; take every even index for a clean string.
         unsigned char sn_buf[256] = {0};
         int sn_len = 0;
-        DevEnum e;
-        if (APC_GetSerialNumber(impl_->handle, &tmp, sn_buf, sizeof(sn_buf), &sn_len) == APC_OK
+        DevEnum dev;
+        if (APC_GetSerialNumber(impl_->handle, &dev_sel, sn_buf, sizeof(sn_buf), &sn_len) == APC_OK
             && sn_len > 0) {
-            // Clamp against the buffer to bound the index walk below if the
-            // returned sn_len ever exceeds the buffer it filled.
-            const int chars = std::min(sn_len / 2,
-                                       static_cast<int>(sizeof(sn_buf) / 2));
-            e.serial_number.resize(static_cast<size_t>(chars));
-            for (int j = 0; j < chars; ++j) {
-                e.serial_number[j] = static_cast<char>(sn_buf[j * 2]);
+            dev.serial_number = decode_serial(sn_buf, sn_len, sizeof(sn_buf));
+        }
+        // APC_GetDeviceInfo can fail transiently right after enumeration; a
+        // zeroed descriptor empties usb_port and breaks a usb_port pin match.
+        // Retry before giving up.
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            if (APC_GetDeviceInfo(impl_->handle, &dev_sel, &info) == APC_OK) {
+                if (info.strDevName) dev.dev_node.assign(info.strDevName);
+                dev.pid = info.wPID;
+                break;
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        if (APC_GetDeviceInfo(impl_->handle, &tmp, &info) == APC_OK) {
-            if (info.strDevName) e.v4l2.assign(info.strDevName);
-            e.pid = info.wPID;
-        }
-        e.usb_port = resolve_usb_port(e.v4l2);
-        return e;
+        dev.usb_port = resolve_usb_port(dev.dev_node);
+        return dev;
     };
 
-    const unsigned short want_pid = expected_pid_for_model(cfg.model);
+    const unsigned short want_pid = cfg.expected_pid;
 
     auto log_devices = [&]() {
         for (int i = 0; i < dev_count; ++i) {
-            const auto e = enumerate(i);
+            const auto dev = enumerate(i);
             RCLCPP_ERROR(logger(),
                          "  [%d] PID=0x%04x sn='%s' v4l2='%s' usb_port='%s'",
-                         i, e.pid, e.serial_number.c_str(), e.v4l2.c_str(), e.usb_port.c_str());
+                         i, dev.pid, dev.serial_number.c_str(), dev.dev_node.c_str(), dev.usb_port.c_str());
         }
     };
 
     if (!cfg.serial_number.empty() || !cfg.usb_port.empty()) {
         for (int i = 0; i < dev_count; ++i) {
-            const auto e = enumerate(i);
-            const bool sn_match  = !cfg.serial_number.empty() &&
-                                   e.serial_number.find(cfg.serial_number) != std::string::npos;
-            const bool bus_match = !cfg.usb_port.empty() &&
-                                   !e.usb_port.empty() &&
-                                   e.usb_port.find(cfg.usb_port) != std::string::npos;
-            if (sn_match || (cfg.serial_number.empty() && bus_match)) {
+            const auto dev = enumerate(i);
+            // Both hints must hold: an unset hint always passes, a set hint
+            // must match. When both are pinned, a matching serial on the
+            // wrong port is rejected (not silently accepted).
+            const bool sn_ok  = cfg.serial_number.empty() ||
+                                dev.serial_number.find(cfg.serial_number) != std::string::npos;
+            const bool bus_ok = cfg.usb_port.empty() ||
+                                (!dev.usb_port.empty() &&
+                                 dev.usb_port.find(cfg.usb_port) != std::string::npos);
+            if (sn_ok && bus_ok) {
                 chosen_index = i;
                 RCLCPP_INFO(logger(),
-                            "Matched device at index %d (sn='%s', v4l2='%s', usb_port='%s') via %s",
-                            i, e.serial_number.c_str(), e.v4l2.c_str(), e.usb_port.c_str(),
-                            sn_match ? "serial_number" : "usb_port");
+                            "Matched device at index %d (sn='%s', v4l2='%s', usb_port='%s')",
+                            i, dev.serial_number.c_str(), dev.dev_node.c_str(), dev.usb_port.c_str());
                 break;
             }
         }
@@ -519,6 +622,7 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
                          cfg.serial_number.c_str(), cfg.usb_port.c_str(), dev_count);
             log_devices();
             APC_Release(&impl_->handle);
+            impl_->handle = nullptr;
             return false;
         }
     } else if (want_pid != 0) {
@@ -527,15 +631,15 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
         // from binding to the same physical device when both are connected.
         int pid_match_count = 0;
         for (int i = 0; i < dev_count; ++i) {
-            const auto e = enumerate(i);
-            if (e.pid == want_pid) {
+            const auto dev = enumerate(i);
+            if (dev.pid == want_pid) {
                 ++pid_match_count;
                 if (chosen_index < 0) {
                     chosen_index = i;
                     RCLCPP_INFO(logger(),
                                 "Matched device at index %d (PID=0x%04x sn='%s' v4l2='%s' usb_port='%s') "
                                 "via model '%s' PID lookup",
-                                i, e.pid, e.serial_number.c_str(), e.v4l2.c_str(), e.usb_port.c_str(),
+                                i, dev.pid, dev.serial_number.c_str(), dev.dev_node.c_str(), dev.usb_port.c_str(),
                                 cfg.model.c_str());
                 }
             }
@@ -553,6 +657,7 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
                          cfg.model.c_str(), want_pid, dev_count);
             log_devices();
             APC_Release(&impl_->handle);
+            impl_->handle = nullptr;
             return false;
         }
     } else {
@@ -566,14 +671,36 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
     // Cache the device identity strings; immutable after selection
     // and read on every diagnostics tick.
     {
-        const auto e = enumerate(impl_->sel.index);
-        impl_->serial_number = e.serial_number;
-        impl_->usb_port = e.usb_port;
+        const auto dev = enumerate(impl_->sel.index);
+        impl_->serial_number = dev.serial_number;
+        impl_->usb_port = dev.usb_port;
+    }
+
+    // Reject a mode whose USB port type the negotiated link cannot carry
+    // (e.g. a USB3-only mode on a USB2 link) up front, before configuring
+    // streams — otherwise the device opens but delivers no frames.
+    if (cfg.mode_usb == 2 || cfg.mode_usb == 3) {
+        USB_PORT_TYPE port = USB_PORT_TYPE_UNKNOW;
+        if (APC_GetDevicePortType(impl_->handle, &impl_->sel, &port) == APC_OK &&
+            (port == USB_PORT_TYPE_2_0 || port == USB_PORT_TYPE_3_0)) {
+            const int link = (port == USB_PORT_TYPE_3_0) ? 3 : 2;
+            if (link != cfg.mode_usb) {
+                RCLCPP_ERROR(logger(),
+                             "mode_id needs a USB%d link but the camera negotiated USB%d. "
+                             "Pick a USB%d mode_id, or move the camera to a USB%d port.",
+                             cfg.mode_usb, link, link, cfg.mode_usb);
+                APC_Release(&impl_->handle);
+                impl_->handle = nullptr;
+                return false;
+            }
+            RCLCPP_INFO(logger(), "Negotiated USB link: USB%d", link);
+        }
     }
 
     if ((ret = APC_GetDeviceInfo(impl_->handle, &impl_->sel, &impl_->dev_info)) != APC_OK) {
-        RCLCPP_ERROR(logger(), "APC_GetDeviceInfo failed (%d)", ret);
+        RCLCPP_ERROR(logger(), "APC_GetDeviceInfo failed: %s", espdi_strerror(ret).c_str());
         APC_Release(&impl_->handle);
+        impl_->handle = nullptr;
         return false;
     }
     RCLCPP_INFO(logger(),
@@ -593,6 +720,7 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
                      "model parameters at the firmware.",
                      cfg.model.c_str(), want_pid, impl_->dev_info.wPID);
         APC_Release(&impl_->handle);
+        impl_->handle = nullptr;
         return false;
     }
 
@@ -605,7 +733,7 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
             RCLCPP_INFO(logger(), "FW version: %s", fw_buf);
         } else {
             RCLCPP_WARN(logger(),
-                        "APC_GetFwVersion rc=%d (len=%d)", fw_rc, fw_len);
+                        "APC_GetFwVersion %s (len=%d)", espdi_strerror(fw_rc).c_str(), fw_len);
         }
     }
 
@@ -622,11 +750,22 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
     // shift is only valid when a depth stream is configured; color-only
     // modes carry depth_data_type 0 or 5 and must pass through unchanged.
     const bool depth_present = cfg.depth_width > 0 && cfg.depth_height > 0;
-    const bool apply_disparity_shift = cfg.spatial_filter_enabled && depth_present;
+    bool apply_disparity_shift = cfg.spatial_filter_enabled && depth_present;
     if (cfg.spatial_filter_enabled && !depth_present) {
         RCLCPP_WARN(logger(),
                     "spatial_filter requested but the active mode has no "
                     "depth stream ; filter disabled, depth_data_type left unchanged.");
+    }
+    // The +2 shift reaches the 11-bit counterpart only for the types that
+    // have one. video_modes_dir is public, so the type is not assumed valid.
+    static const std::set<int> kShiftableDepthTypes = {2, 7, 18, 34, 50};
+    if (apply_disparity_shift &&
+        kShiftableDepthTypes.count(cfg.depth_data_type) == 0) {
+        RCLCPP_ERROR(logger(),
+                     "depth_data_type %d has no 11-bit counterpart at %d; "
+                     "spatial filter disabled",
+                     cfg.depth_data_type, cfg.depth_data_type + 2);
+        apply_disparity_shift = false;
     }
     const int effective_depth_dt = apply_disparity_shift
         ? cfg.depth_data_type + 2
@@ -644,8 +783,10 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
     if ((ret = APC_SetDepthDataType(impl_->handle, &impl_->sel,
                                     static_cast<unsigned short>(effective_depth_dt))) != APC_OK) {
         RCLCPP_ERROR(logger(),
-                     "APC_SetDepthDataType(%d) failed (%d)", effective_depth_dt, ret);
+                     "APC_SetDepthDataType(%d) failed: %s", effective_depth_dt,
+                     espdi_strerror(ret).c_str());
         APC_Release(&impl_->handle);
+        impl_->handle = nullptr;
         return false;
     }
     // Store the effective dtype so downstream code (fetch threads,
@@ -661,25 +802,106 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
 
     if ((ret = APC_SetInterleaveMode(impl_->handle, &impl_->sel, cfg.interleave)) != APC_OK) {
         RCLCPP_WARN(logger(),
-                    "APC_SetInterleaveMode(%d) returned %d", cfg.interleave, ret);
+                    "APC_SetInterleaveMode(%d): %s", cfg.interleave,
+                    espdi_strerror(ret).c_str());
     }
 
-    // IR projector level is applied before APC_OpenDevice2 so the
-    // V4L2 capture buffer fills at the configured illumination from the
-    // first frame. cfg.ir_intensity ≥ 0 selects an explicit value;
-    // -1 selects the per-PID default. IR-MAX and mode-mask are left at
-    // their firmware boot values (G62 IR-MAX = 96; G100+/R77 IR-MAX ≥ 6).
+    // Applied before APC_OpenDevice2 so the first frame already carries the
+    // configured illumination. ir_value >= 0 is explicit (0 = off); -1 resolves
+    // to the catalogue default when the mode has depth or the module is
+    // monochrome (a mono sensor needs IR to light the scene even for colour),
+    // and to off for a colour-only mode on a colour sensor. IR-MAX and the
+    // mode-mask keep their firmware boot values.
     {
-        const bool explicit_ir = cfg.ir_intensity >= 0;
+        const bool needs_ir = (cfg.depth_width > 0 && cfg.depth_height > 0)
+                              || cfg.mono;
+        impl_->ir_default_level = needs_ir ? cfg.ir_default : 0;
+        const bool explicit_ir = cfg.ir_value >= 0;
         const int level = explicit_ir
-            ? cfg.ir_intensity
-            : default_ir_level_for_pid(impl_->dev_info.wPID);
+            ? cfg.ir_value
+            : impl_->ir_default_level;
         const int rc_cur = APC_SetCurrentIRValue(
             impl_->handle, &impl_->sel,
             static_cast<unsigned short>(level));
         RCLCPP_INFO(logger(),
-                    "IR pre-open: SetCurrentIRValue(%d) rc=%d (%s)",
-                    level, rc_cur, explicit_ir ? "explicit" : "default");
+                    "IR pre-open: SetCurrentIRValue(%d) %s (%s)",
+                    level, espdi_strerror(rc_cur).c_str(),
+                    explicit_ir ? "explicit" : "default");
+    }
+
+    // Read calibration and the ZD table BEFORE opening the streams: against an
+    // already-open handle the read can hang indefinitely if the camera is
+    // unplugged mid-open, against an un-opened handle it fails cleanly.
+    //
+    // Both come from zd_index, the G1 factory bank, and stay correct after a
+    // self-calibration commit: GetRectifyMatLogData reads the Calibration Log
+    // (flash file 240), not the Rectify Table (file 40) selfk writes, and the
+    // factory ships G1 == G2. The G2/G1 bank offset (FW reg 0xF6) is only valid
+    // after APC_OpenDevice2 and is read there.
+
+    // Rectification log -> both lens calibration slots so the left and right
+    // camera_info topics can publish independently; it carries both intrinsics
+    // regardless of the active video mode. Retry on APC_READFLASHFAIL (-6),
+    // which can occur transiently right after a fast reopen of the same device.
+    {
+        constexpr int kMaxRectifyAttempts = 4;
+        constexpr int kRectifyBackoffMs   = 150;
+        int rc = APC_OK;
+        for (int attempt = 0; attempt < kMaxRectifyAttempts; ++attempt) {
+            rc = APC_GetRectifyMatLogData(
+                impl_->handle, &impl_->sel, &impl_->cached_rect, cfg.zd_index);
+            if (rc == APC_OK) break;
+            if (rc != APC_READFLASHFAIL) break;
+            RCLCPP_WARN(logger(),
+                        "APC_GetRectifyMatLogData(index=%d) %s (flash read), "
+                        "retry %d/%d after %d ms",
+                        cfg.zd_index, espdi_strerror(rc).c_str(), attempt + 1,
+                        kMaxRectifyAttempts, kRectifyBackoffMs);
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kRectifyBackoffMs));
+        }
+        if (rc != APC_OK) {
+            // Drop the previous open's values; leaving them would publish the
+            // old calibration as if it were this mode's.
+            impl_->cached_rect_valid = false;
+            impl_->calib = {};
+            RCLCPP_WARN(logger(),
+                        "APC_GetRectifyMatLogData(index=%d) %s ; camera_info will be empty",
+                        cfg.zd_index, espdi_strerror(rc).c_str());
+        } else {
+            impl_->cached_rect_valid = true;
+            const auto& rect = impl_->cached_rect;
+            auto& calib = impl_->calib;
+            calib.in_height  = rect.InImgHeight;
+            calib.out_height = rect.OutImgHeight;
+            for (int i = 0; i < 9; ++i)  calib.left.K[i]  = rect.CamMat1[i];
+            for (int i = 0; i < 8; ++i)  calib.left.D[i]  = rect.CamDist1[i];
+            for (int i = 0; i < 9; ++i)  calib.left.R[i]  = rect.LRotaMat[i];
+            for (int i = 0; i < 12; ++i) calib.left.P[i]  = rect.NewCamMat1[i];
+            for (int i = 0; i < 9; ++i)  calib.right.K[i] = rect.CamMat2[i];
+            for (int i = 0; i < 8; ++i)  calib.right.D[i] = rect.CamDist2[i];
+            for (int i = 0; i < 9; ++i)  calib.right.R[i] = rect.RRotaMat[i];
+            for (int i = 0; i < 12; ++i) calib.right.P[i] = rect.NewCamMat2[i];
+            calib.baseline_mm = std::abs(static_cast<double>(rect.TranMat[0]));
+            calib.valid = true;
+            RCLCPP_INFO(logger(),
+                        "Rectify loaded (index=%d): L fx=%.2f cx=%.2f / R fx=%.2f cx=%.2f / baseline=%.2f mm",
+                        cfg.zd_index,
+                        calib.left.K[0], calib.left.K[2],
+                        calib.right.K[0], calib.right.K[2], calib.baseline_mm);
+        }
+    }
+    // ZD (disparity->mm) table — needed only when the spatial filter runs.
+    // A load failure with the filter requested is a hard error. The device is
+    // not open yet, so release the handle without APC_CloseDevice.
+    if (apply_disparity_shift &&
+        !load_zd_table(impl_->handle, &impl_->sel, cfg.zd_index, impl_->zd_table)) {
+        RCLCPP_ERROR(logger(),
+                     "Spatial filter requested but ZD table load failed "
+                     "(index=%d). Refusing to open.", cfg.zd_index);
+        APC_Release(&impl_->handle);
+        impl_->handle = nullptr;
+        return false;
     }
 
     // APC_OpenDevice2 writes the negotiated fps through a raw int*; bounce
@@ -695,15 +917,16 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
         static_cast<bool>(cfg.color_format),
         cfg.depth_width, cfg.depth_height,
         DEPTH_IMG_NON_TRANSFER,
-        /*bIsOutputRGB24=*/true,
+        /*bIsOutputRGB24=*/false,
         /*phWndNotice=*/nullptr,
         &negotiated_fps,
         IMAGE_SN_SYNC);
     if (ret != APC_OK) {
         RCLCPP_ERROR(logger(),
-                     "APC_OpenDevice2 failed (%d) ; requested fps=%d, got %d",
-                     ret, cfg.framerate, negotiated_fps);
+                     "APC_OpenDevice2 failed: %s ; requested fps=%d, got %d",
+                     espdi_strerror(ret).c_str(), cfg.framerate, negotiated_fps);
         APC_Release(&impl_->handle);
+        impl_->handle = nullptr;
         return false;
     }
     impl_->actual_fps.store(negotiated_fps, std::memory_order_relaxed);
@@ -714,11 +937,25 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
                 cfg.depth_width, cfg.depth_height, cfg.depth_data_type,
                 negotiated_fps, cfg.interleave ? 1 : 0);
 
-    // Read the FW-reported IR ceiling (reg 0xE2) so set_ir_intensity can
+    // Active calibration bank from FW register 0xF6: 5 = the module has a G2
+    // user bank (self-calibration may commit there); 0 = G1 factory only.
+    // Read here, not before APC_OpenDevice2 — the SDK's open is what sets 0xF6
+    // to 5 on a G2 unit (its power-on default is 0). Used only for the
+    // self-calibration commit target and the "has G2" support check.
+    {
+        unsigned short bank = 0;
+        const int rc = APC_GetFWRegister(impl_->handle, &impl_->sel, 0xF6, &bank,
+                                         FG_Address_1Byte | FG_Value_1Byte);
+        impl_->calib_bank_offset = (rc == APC_OK && bank == 5) ? 5 : 0;
+        RCLCPP_INFO(logger(), "Calibration banks: %s (0xF6=%u)",
+                    impl_->calib_bank_offset == 5 ? "G1 factory + G2 user"
+                                                  : "G1 factory only",
+                    bank);
+    }
+
+    // Read the FW-reported IR ceiling (reg 0xE2) so set_ir_value can
     // clamp user-supplied values, and log the current level for diagnostics.
     {
-        impl_->ir_default_level = default_ir_level_for_pid(impl_->dev_info.wPID);
-
         unsigned short ir_max = 0, ir_cur = 0;
         const int rc_max = APC_GetFWRegister(
             impl_->handle, &impl_->sel, kFwRegIrMax, &ir_max,
@@ -733,107 +970,34 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
                     ir_cur, ir_max, impl_->ir_default_level);
     }
 
-    // Load the rectification log into both lens calibration slots so left
-    // and right camera_info topics can publish independently. The log
-    // contains both intrinsics regardless of the active video mode.
-    //
-    // Retry on APC_READFLASHFAIL (-6): the initial flash read can fail
-    // transiently after a fast reopen of the same device. A short backoff
-    // and re-attempt recovers without needing to power-cycle the camera.
-    {
-        constexpr int kMaxRectifyAttempts = 4;
-        constexpr int kRectifyBackoffMs   = 150;
-        int rc = APC_OK;
-        for (int attempt = 0; attempt < kMaxRectifyAttempts; ++attempt) {
-            rc = APC_GetRectifyMatLogData(
-                impl_->handle, &impl_->sel, &impl_->cached_rect, cfg.zd_index);
-            if (rc == APC_OK) break;
-            if (rc != APC_READFLASHFAIL) break;
-            RCLCPP_WARN(logger(),
-                        "APC_GetRectifyMatLogData(index=%d) rc=%d (flash read), "
-                        "retry %d/%d after %d ms",
-                        cfg.zd_index, rc, attempt + 1,
-                        kMaxRectifyAttempts, kRectifyBackoffMs);
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(kRectifyBackoffMs));
-        }
-        if (rc != APC_OK) {
-            RCLCPP_WARN(logger(),
-                        "APC_GetRectifyMatLogData(index=%d) rc=%d ; camera_info will be empty",
-                        cfg.zd_index, rc);
-        } else {
-            impl_->cached_rect_valid = true;
-            const auto& log = impl_->cached_rect;
-            auto& c = impl_->calib;
-            // Use color dims when color is active; fall back to depth dims for
-            // D-only modes so camera_info still carries valid width/height.
-            c.width  = cfg.color_width  > 0 ? cfg.color_width  : cfg.depth_width;
-            c.height = cfg.color_height > 0 ? cfg.color_height : cfg.depth_height;
-            for (int i = 0; i < 9; ++i)  c.left.K[i]  = log.CamMat1[i];
-            for (int i = 0; i < 5; ++i)  c.left.D[i]  = log.CamDist1[i];
-            for (int i = 0; i < 9; ++i)  c.left.R[i]  = log.LRotaMat[i];
-            for (int i = 0; i < 12; ++i) c.left.P[i]  = log.NewCamMat1[i];
-            for (int i = 0; i < 9; ++i)  c.right.K[i] = log.CamMat2[i];
-            for (int i = 0; i < 5; ++i)  c.right.D[i] = log.CamDist2[i];
-            for (int i = 0; i < 9; ++i)  c.right.R[i] = log.RRotaMat[i];
-            for (int i = 0; i < 12; ++i) c.right.P[i] = log.NewCamMat2[i];
-            c.baseline_mm = std::abs(static_cast<double>(log.TranMat[0]));
-            c.valid = true;
-            RCLCPP_INFO(logger(),
-                        "Rectify loaded (index=%d): L fx=%.2f cx=%.2f / R fx=%.2f cx=%.2f / baseline=%.2f mm",
-                        cfg.zd_index,
-                        c.left.K[0], c.left.K[2], c.right.K[0], c.right.K[2], c.baseline_mm);
-        }
-    }
-
     // Colored point cloud requires a configured color stream; D-only
     // modes use the XYZ-only path.
     impl_->colored_pointcloud = cfg.colored_pointcloud && cfg.color_width > 0 && cfg.color_height > 0;
 
-    // Spatial filter: launch-time only. The depth stream is already
-    // in 11-bit disparity mode at this point (apply_disparity_shift
-    // forced the dtype +2 above), so a ZD table load failure is a
-    // hard error rather than a silent fallback. Skipped entirely on
-    // color-only modes — the WARN was emitted above when the dtype
-    // shift was bypassed.
+    // Spatial filter params: launch-time only. The depth stream is in 11-bit
+    // disparity mode here (apply_disparity_shift forced the dtype +2 above).
+    // Skipped on color-only modes.
     impl_->spatial_filter_enabled = false;
     if (apply_disparity_shift) {
-        const double a = std::clamp(cfg.spatial_filter_alpha, 0.0, 1.0);
-        impl_->spatial_params.alpha_q8      = static_cast<int>(std::lround(a * 256.0));
+        const double alpha = std::clamp(cfg.spatial_filter_alpha, 0.0, 1.0);
+        impl_->spatial_params.alpha_q8      = static_cast<int>(std::lround(alpha * 256.0));
         // Clamp keeps the Q4 shift inside uint16.
         impl_->spatial_params.delta_q4      = std::clamp(cfg.spatial_filter_delta, 1, 4095) << 4;
         impl_->spatial_params.magnitude     = std::clamp(cfg.spatial_filter_magnitude, 1, 5);
         impl_->spatial_params.holes_fill = std::max(0, cfg.spatial_filter_holes_fill);
-        if (!load_zd_table(impl_->handle, &impl_->sel,
-                           cfg.zd_index, impl_->zd_table)) {
-            RCLCPP_ERROR(logger(),
-                         "Spatial filter requested but ZD table load failed "
-                         "(zd_index=%d). Refusing to open.",
-                         cfg.zd_index);
-            // APC_OpenDevice2 already succeeded above, so the device
-            // pipe + V4L2 fds need to be released by APC_CloseDevice
-            // before the SDK handle is freed by APC_Release. Skipping
-            // close leaks the device resources across reconnect loops.
-            APC_CloseDevice(impl_->handle, &impl_->sel);
-            APC_Release(&impl_->handle);
-            impl_->handle = nullptr;
-            return false;
-        }
+        // The ZD table it needs was loaded from flash before the streams
+        // opened (a load failure there already refused the open).
         impl_->spatial_filter_enabled = true;
     }
 
-    // Temporal filter: runs in whichever domain has a uint16 raster
-    // available. With spatial_filter on, it lives between the IIR and
-    // the ZD lookup (Q4 disparity units); with spatial_filter off, it
-    // runs directly on the FW Z14 mm depth raster. delta is stored
-    // raw and converted at the call site (`<< 4` for the Q4 pipeline,
-    // used as mm for the Z pipeline). Seeded here from launch values
-    // regardless of spatial state; runtime updates flow through
-    // set_temporal_filter().
+    // Runs in whichever domain has a uint16 raster: between the IIR and
+    // the ZD lookup (Q4 disparity) when spatial_filter is on, on the FW
+    // Z14 mm raster when it is off. delta is stored raw and converted at
+    // the call site -- `<< 4` for Q4, used as mm for Z.
     {
-        const double ta = std::clamp(cfg.temporal_filter_alpha, 0.0, 1.0);
+        const double alpha = std::clamp(cfg.temporal_filter_alpha, 0.0, 1.0);
         TemporalFilterParams tp;
-        tp.alpha_q8    = static_cast<int>(std::lround(ta * 256.0));
+        tp.alpha_q8    = static_cast<int>(std::lround(alpha * 256.0));
         // Clamp keeps the Q4 promote (`<<= 4`) inside uint16.
         tp.delta       = std::clamp(cfg.temporal_filter_delta, 1, 4095);
         tp.persistence = std::clamp(cfg.temporal_filter_persistence, 0, 8);
@@ -858,35 +1022,34 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
     // into the kernel; with it, the post-ZD-lookup buffer does.
     impl_->hole_fill_mode = HoleFillMode::kOff;
     if (cfg.hole_filling > 0) {
-        const int m = std::clamp(cfg.hole_filling, 0, 3);
-        impl_->hole_fill_mode = static_cast<HoleFillMode>(m);
-        const char* name = (m == 1) ? "fill_from_left"
-                         : (m == 2) ? "farthest_from_around"
-                                    : "nearest_from_around";
-        RCLCPP_INFO(logger(), "Hole filling enabled: mode=%d (%s)", m, name);
+        const int mode = std::clamp(cfg.hole_filling, 0, 3);
+        impl_->hole_fill_mode = static_cast<HoleFillMode>(mode);
+        const char* name = (mode == 1) ? "fill_from_left"
+                         : (mode == 2) ? "farthest_from_around"
+                                       : "nearest_from_around";
+        RCLCPP_INFO(logger(), "Hole filling enabled: mode=%d (%s)", mode, name);
     }
 
-    // PointCloud Z clip range. Launch parameters depth_minimum_mm /
-    // depth_maximum_mm > 0 override; -1 = use per-PID default.
+    // PointCloud working range. Launch parameters depth_near_mm /
+    // depth_far_mm > 0 override; -1 = use the catalogue default.
     {
-        const auto def = depth_range_for_pid(impl_->dev_info.wPID);
-        const float resolved_near = (cfg.depth_minimum_mm > 0)
-            ? static_cast<float>(cfg.depth_minimum_mm)
-            : static_cast<float>(def.near_mm);
-        const float resolved_far  = (cfg.depth_maximum_mm > 0)
-            ? static_cast<float>(cfg.depth_maximum_mm)
-            : static_cast<float>(def.far_mm);
+        const float resolved_near = (cfg.depth_near_mm > 0)
+            ? static_cast<float>(cfg.depth_near_mm)
+            : static_cast<float>(cfg.default_near_mm);
+        const float resolved_far  = (cfg.depth_far_mm > 0)
+            ? static_cast<float>(cfg.depth_far_mm)
+            : static_cast<float>(cfg.default_far_mm);
 
-        impl_->max_near_mm = resolved_near;
-        impl_->max_far_mm  = resolved_far;
+        impl_->depth_near_mm = resolved_near;
+        impl_->depth_far_mm  = resolved_far;
 
         RCLCPP_INFO(logger(),
-                    "Depth clip range: near=%.0f mm (%s)  far=%.0f mm (%s)  (default=[%d, %d] mm)",
+                    "Depth range: near=%.0f mm (%s)  far=%.0f mm (%s)  (default=[%d, %d] mm)",
                     resolved_near,
-                    (cfg.depth_minimum_mm > 0) ? "explicit" : "default",
+                    (cfg.depth_near_mm > 0) ? "explicit" : "default",
                     resolved_far,
-                    (cfg.depth_maximum_mm > 0) ? "explicit" : "default",
-                    def.near_mm, def.far_mm);
+                    (cfg.depth_far_mm > 0) ? "explicit" : "default",
+                    cfg.default_near_mm, cfg.default_far_mm);
     }
 
     {
@@ -895,12 +1058,49 @@ bool EspdiDevice::open(const DeviceConfig& cfg) {
         impl_->latest.depth_pending = false;
     }
 
+    // Bind a self-calibration context to the open handle; dormant until
+    // start_selfcal(). Creation does not touch the stream.
+    if (cfg.selfcal_enable) {
+        impl_->selfcal_ = std::make_unique<SelfCalManager>(
+            impl_->handle, &impl_->sel, &impl_->dev_info,
+            impl_->serial_number, cfg.selfcal_config_dir, logger());
+        // Let the A/B re-check toggle cy on the live stream through the locked
+        // register accessors.
+        impl_->selfcal_->set_cy_accessors(
+            [this](unsigned short& lo, unsigned short& hi) {
+                return get_cy_regs(lo, hi);
+            },
+            [this](unsigned short lo, unsigned short hi) {
+                return set_cy_regs(lo, hi);
+            });
+        if (impl_->selfcal_->available()) {
+            RCLCPP_INFO(logger(),
+                        "Self-calibration bound (profiles dir: '%s')",
+                        cfg.selfcal_config_dir.c_str());
+        }
+    }
+
     impl_->opened = true;
     return true;
 }
 
 void EspdiDevice::close() {
     if (!impl_) return;
+    // stop() (idempotent) before releasing the handle, so a close() while
+    // streaming cannot free it under the fetch threads. It takes lifecycle_mtx
+    // itself, so it must run before the lock below.
+    stop();
+    // Tear down the session before the handle is released — ~SelfCalManager
+    // calls EYS3D_SC_Stop/Destroy through it. stop() already joined depth_fetch.
+    impl_->selfcal_.reset();
+    if (impl_->cy_snapshot_valid) {
+        // A session abandoned mid-flight (node shutdown / disconnect): roll cy
+        // back before releasing the handle so a live device is not left on a
+        // half-search value. On a disconnect the handle is already dead and the
+        // write logs one warning; the reconnect reloads calibration from flash.
+        restore_cy();
+        impl_->cy_snapshot_valid = false;
+    }
     std::lock_guard<std::mutex> lifecycle_lk(impl_->lifecycle_mtx);
     if (impl_->opened && impl_->handle) {
         RCLCPP_INFO(logger(), "close(): APC_CloseDevice...");
@@ -957,8 +1157,8 @@ void EspdiDevice::spawn_fetch_threads_() {
 
     // Reset SN baselines so a close/reopen cycle doesn't register the SN
     // restart as a giant dropped-frame burst.
-    impl_->last_color_sn.store(-1, std::memory_order_relaxed);
-    impl_->last_depth_sn.store(-1, std::memory_order_relaxed);
+    impl_->last_color_frame.store(-1, std::memory_order_relaxed);
+    impl_->last_depth_frame.store(-1, std::memory_order_relaxed);
 
     if (impl_->color_stream_present) {
     // Color fetch thread. The wire payload (YUYV or MJPEG) is read
@@ -970,23 +1170,22 @@ void EspdiDevice::spawn_fetch_threads_() {
         const int  cw = cfg.color_width;
         const int  ch = cfg.color_height;
         const bool wire_is_mjpeg = (cfg.color_format == 1);
-        // Split-aware YUYV decode emits two half-width rgb8 buffers in
-        // one pass, avoiding the wide rgb8 intermediate and the
-        // row-by-row split memcpy. MJPEG modes cannot be split during
-        // decode (libjpeg-turbo's MCU blocks do not align with the
-        // mid-row boundary) and continue to decode wide and slice in
-        // camera_node.
+        // Split-aware YUYV decode emits both half-width rgb8 buffers in one
+        // pass. MJPEG cannot be split during decode -- libjpeg-turbo's MCU
+        // blocks do not align with the mid-row boundary -- so those modes
+        // decode wide and are sliced in camera_node.
+        // %4, not %2: the half-width (cw/2) must itself be even so each eye's
+        // split lands on a YUYV macropixel (2 px / 4 bytes) boundary.
         const bool split_yuyv = cfg.split_color && !wire_is_mjpeg &&
-                                (cw % 2 == 0);
+                                (cw % 4 == 0);
         const int  side_w   = split_yuyv ? cw / 2 : cw;
+        const bool mono = cfg.mono;
         const size_t raw_bytes = color_raw_buffer_bytes(cw, ch);
-        // rgb_bytes sizes the per-frame fb.data:
-        //   - YUYV split: side_w = cw/2, so this is the half-width buffer
-        //     and the SIMD split writer fills both halves in one pass.
-        //   - MJPEG split: side_w = cw, fb.data holds the full wide raster
-        //     and tjDecompress2 writes cw*ch*3 bytes into it; the actual
-        //     left/right split happens later in publish_split_color.
-        //   - non-split: side_w = cw, single per-side buffer.
+        // rgb_bytes sizes fb.data:
+        //   YUYV split   side_w = cw/2; both halves are filled in one pass.
+        //   MJPEG split  side_w = cw; fb.data holds the wide raster and the
+        //                left/right split happens in publish_split_color.
+        //   non-split    side_w = cw, one buffer.
         const size_t rgb_bytes = color_rgb8_bytes(side_w, ch);
 
         // Reused across iterations — the SDK reads into this buffer, then
@@ -995,9 +1194,10 @@ void EspdiDevice::spawn_fetch_threads_() {
         // of one per frame.
         std::vector<uint8_t> raw(raw_bytes);
 
-        // libjpeg-turbo decompressor for MJPEG modes. TJPF_RGB tells
-        // turbojpeg to emit rgb8 directly; for grayscale-source JPEGs
-        // (R77 / G62) it replicates Y → R=G=B internally. Symbols
+        std::vector<uint8_t> gray;
+        if (mono) gray.resize(static_cast<size_t>(cw) * ch);
+
+        // libjpeg-turbo decompressor for MJPEG modes. Symbols
         // (tjInitDecompress / tjDecompress2 / tjDestroy) are re-exported
         // from libeSPDI, so no external libjpeg link is required.
         tjhandle tj = wire_is_mjpeg ? tjInitDecompress() : nullptr;
@@ -1008,28 +1208,29 @@ void EspdiDevice::spawn_fetch_threads_() {
 
         while (impl_->running.load(std::memory_order_acquire)) {
           try {
-            unsigned long got = 0;
-            int serial = 0;
+            unsigned long image_bytes = 0;
+            int frame_number = 0;
             int64_t tv_sec = 0, tv_usec = 0;
             const int rc = APC_GetColorImageWithTimestamp(
-                handle, sel, raw.data(), &got, &serial,
+                handle, sel, raw.data(), &image_bytes, &frame_number,
                 depth_dt, &tv_sec, &tv_usec);
             if (rc != APC_OK) {
                 if (rc == APC_DEVICE_TIMEOUT) {
                     usleep(kTimeoutBackoffUs);
                 } else {
+                    usleep(kErrorBackoffUs);
                     // Throttle unexpected return codes so a misconfigured
                     // stream remains visible without flooding the log.
                     RCLCPP_WARN_THROTTLE(logger(),
                                          throttle_clock(), 5000,
-                                         "APC_GetColorImageWithTimestamp rc=%d", rc);
+                                         "APC_GetColorImageWithTimestamp %s", espdi_strerror(rc).c_str());
                 }
                 continue;
             }
             // Interleave SN parity: in interleave mode both streams deliver
-            // every frame and the consumer selects by serial number parity
+            // every frame and the consumer selects by frame number parity
             // (color = even, depth = odd).
-            if (interleave && (serial % 2) != 0) {
+            if (interleave && (frame_number % 2) != 0) {
                 continue;
             }
             // Detect frames lost in transit. After parity filtering,
@@ -1037,10 +1238,10 @@ void EspdiDevice::spawn_fetch_threads_() {
             // forward gap means the USB / SDK layer dropped one or more
             // frames before they reached the fetch loop.
             const int step = interleave ? 2 : 1;
-            const int prev_sn = impl_->last_color_sn.exchange(
-                serial, std::memory_order_relaxed);
-            if (prev_sn >= 0) {
-                const int delta = serial - prev_sn;
+            const int prev = impl_->last_color_frame.exchange(
+                frame_number, std::memory_order_relaxed);
+            if (prev >= 0) {
+                const int delta = frame_number - prev;
                 if (delta > step && delta < 10000) {
                     impl_->color_input_dropped.fetch_add(
                         static_cast<uint64_t>((delta / step) - 1),
@@ -1067,21 +1268,61 @@ void EspdiDevice::spawn_fetch_threads_() {
                 continue;
             }
 
+            // The YUYV kernels read cw*ch*2 bytes from raw; a truncated wire
+            // frame would run them off the buffer. MJPEG carries its own
+            // length (tjDecompress2 is bounded by image_bytes), so guard only
+            // the raw path.
+            if (!wire_is_mjpeg &&
+                image_bytes < static_cast<unsigned long>(cw) * ch * 2) {
+                RCLCPP_WARN_THROTTLE(logger(), throttle_clock(), 5000,
+                                     "short color frame (%lu B < %d expected); dropping",
+                                     image_bytes, cw * ch * 2);
+                continue;
+            }
+
             FrameBuffer fb;
             fb.data.resize(rgb_bytes);
             if (split_yuyv) fb.data_right.resize(rgb_bytes);
-            fb.serial_number = serial;
+            fb.frame_number = frame_number;
             fb.hw_timestamp_us =
                 static_cast<uint64_t>(tv_sec) * 1000000ULL + static_cast<uint64_t>(tv_usec);
             fb.width  = side_w;
             fb.height = ch;
 
             const auto t_decode_begin = std::chrono::steady_clock::now();
-            if (wire_is_mjpeg) {
+            if (mono) {
+                // MJPEG split modes stay wide here — camera_node slices,
+                // matching the color MJPEG path below.
+                if (wire_is_mjpeg) {
+                    if (!tj) continue;
+                    const int drc = tjDecompress2(
+                        tj, raw.data(), image_bytes,
+                        gray.data(),
+                        cw, /*pitch=*/cw, ch,
+                        TJPF_GRAY, /*flags=*/0);
+                    if (drc != 0) {
+                        RCLCPP_WARN_THROTTLE(logger(),
+                                             throttle_clock(), 5000,
+                                             "tjDecompress2 failed: %s",
+                                             tjGetErrorStr2(tj));
+                        continue;
+                    }
+                } else {
+                    simd::yuyv_extract_y(raw.data(), gray.data(), cw, ch);
+                }
+                if (split_yuyv) {
+                    simd::gray_to_rgb8_split(gray.data(),
+                                             fb.data.data(),
+                                             fb.data_right.data(),
+                                             side_w, ch);
+                } else {
+                    simd::gray_to_rgb8(gray.data(), fb.data.data(), cw, ch);
+                }
+            } else if (wire_is_mjpeg) {
                 // MJPEG → rgb8 inline (libjpeg-turbo SIMD; ~5-10 ms / 1.2 MP).
                 if (!tj) continue;
                 const int drc = tjDecompress2(
-                    tj, raw.data(), got,
+                    tj, raw.data(), image_bytes,
                     fb.data.data(),
                     cw, /*pitch=*/cw * 3, ch,
                     TJPF_RGB, /*flags=*/0);
@@ -1093,9 +1334,7 @@ void EspdiDevice::spawn_fetch_threads_() {
                     continue;
                 }
             } else if (split_yuyv) {
-                // Wide YUYV → two half-width rgb8 buffers in one pass.
-                // Saves the wide rgb8 intermediate (≈5.5 MB at 2560x720)
-                // and the row-by-row memcpy split in camera_node.
+                // Wide YUYV -> two half-width rgb8 buffers in one pass.
                 simd::yuyv_to_rgb8_split(raw.data(),
                                          fb.data.data(),
                                          fb.data_right.data(),
@@ -1160,35 +1399,58 @@ void EspdiDevice::spawn_fetch_threads_() {
 
     // Depth fetch thread — symmetric, plus signals pc_thread.
     impl_->depth_fetch = std::thread([this, handle, sel, depth_dt, interleave, &cfg]() {
-        const size_t buf_bytes = depth_buffer_bytes(cfg.depth_width, cfg.depth_height, cfg.depth_data_type);
+        const size_t buf_bytes = depth_buffer_bytes(cfg.depth_width, cfg.depth_height);
+        // Flag a depth stream that never yields a frame, as distinct from a
+        // transient timeout. The threshold clears the several-second
+        // firmware cold start; the warning fires once until a frame arrives.
+        constexpr auto kDepthSilenceWarn = std::chrono::seconds(10);
+        std::chrono::steady_clock::time_point depth_empty_since{};
+        bool depth_silence_warned = false;
         while (impl_->running.load(std::memory_order_acquire)) {
           try {
             FrameBuffer fb;
             fb.data.resize(buf_bytes);
-            unsigned long got = 0;
-            int serial = 0;
+            unsigned long image_bytes = 0;
+            int frame_number = 0;
             int64_t tv_sec = 0, tv_usec = 0;
             const int rc = APC_GetDepthImageWithTimestamp(
-                handle, sel, fb.data.data(), &got, &serial,
+                handle, sel, fb.data.data(), &image_bytes, &frame_number,
                 depth_dt, &tv_sec, &tv_usec);
             if (rc != APC_OK) {
                 if (rc == APC_DEVICE_TIMEOUT) {
                     usleep(kTimeoutBackoffUs);
                 } else {
+                    usleep(kErrorBackoffUs);
                     RCLCPP_WARN_THROTTLE(logger(),
                                          throttle_clock(), 5000,
-                                         "APC_GetDepthImageWithTimestamp rc=%d", rc);
+                                         "APC_GetDepthImageWithTimestamp %s", espdi_strerror(rc).c_str());
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (depth_empty_since.time_since_epoch().count() == 0) {
+                    depth_empty_since = now;
+                } else if (!depth_silence_warned
+                           && now - depth_empty_since > kDepthSilenceWarn) {
+                    depth_silence_warned = true;
+                    RCLCPP_WARN(logger(),
+                                "no depth frame for %llds: "
+                                "APC_GetDepthImageWithTimestamp %s (dtype=%d, %dx%d) ; "
+                                "color may be streaming while depth is not",
+                                static_cast<long long>(kDepthSilenceWarn.count()),
+                                espdi_strerror(rc).c_str(), depth_dt,
+                                cfg.depth_width, cfg.depth_height);
                 }
                 continue;
             }
-            if (interleave && (serial % 2) != 1) {
+            depth_empty_since = std::chrono::steady_clock::time_point{};
+            depth_silence_warned = false;
+            if (interleave && (frame_number % 2) != 1) {
                 continue;
             }
             const int step = interleave ? 2 : 1;
-            const int prev_sn = impl_->last_depth_sn.exchange(
-                serial, std::memory_order_relaxed);
-            if (prev_sn >= 0) {
-                const int delta = serial - prev_sn;
+            const int prev = impl_->last_depth_frame.exchange(
+                frame_number, std::memory_order_relaxed);
+            if (prev >= 0) {
+                const int delta = frame_number - prev;
                 if (delta > step && delta < 10000) {
                     impl_->depth_input_dropped.fetch_add(
                         static_cast<uint64_t>((delta / step) - 1),
@@ -1212,25 +1474,35 @@ void EspdiDevice::spawn_fetch_threads_() {
             // Publishing a smaller buffer would advertise an incorrect Image
             // size to subscribers; a larger buffer would mean the FW returned
             // more bytes than the depth_width * depth_height * bpp budget.
-            if (got != buf_bytes) {
+            if (image_bytes != buf_bytes) {
                 RCLCPP_WARN_THROTTLE(logger(),
                                      throttle_clock(), 5000,
                                      "depth frame size mismatch: got=%lu expected=%zu (dropped)",
-                                     got, buf_bytes);
+                                     image_bytes, buf_bytes);
                 continue;
             }
-            fb.serial_number = serial;
+            fb.frame_number = frame_number;
             fb.hw_timestamp_us =
                 static_cast<uint64_t>(tv_sec) * 1000000ULL + static_cast<uint64_t>(tv_usec);
             fb.width  = cfg.depth_width;
             fb.height = cfg.depth_height;
 
-            // pc_thread becomes the depth publisher whenever any
-            // post-processing filter is active (spatial / temporal /
-            // hole_filling). depth_fetch's job in that case is to
-            // stage the raw FW depth for the filter pipeline. With
-            // all filters off, depth_fetch publishes the raw buffer
-            // directly.
+            // Feed the raw, unclipped FW depth raster to an in-progress session
+            // (no-op when none runs), before the range clip and filters below.
+            // Either depth domain works (Z14 mm or D11 disparity): selfk scores
+            // only the non-zero valid-pixel ratio. selfcal_ is stable here —
+            // created in open() before the threads, reset in close() after join.
+            if (impl_->selfcal_) {
+                impl_->selfcal_->submit_latest(
+                    reinterpret_cast<const uint16_t*>(fb.data.data()),
+                    static_cast<uint32_t>(cfg.depth_width),
+                    static_cast<uint32_t>(cfg.depth_height),
+                    /*temperature_c=*/0.0f, fb.hw_timestamp_us);
+            }
+
+            // With any filter active (spatial / temporal / hole_filling) pc_thread
+            // is the depth publisher and depth_fetch only stages the raw FW depth.
+            // With all filters off, depth_fetch publishes directly.
             const bool depth_gate_open = impl_->gate_pass(impl_->depth_gate);
             const bool pc_gate_open    = impl_->gate_pass(impl_->pc_gate);
             const bool any_filter = impl_->spatial_filter_enabled
@@ -1240,26 +1512,25 @@ void EspdiDevice::spawn_fetch_threads_() {
                 ? (depth_gate_open || pc_gate_open)
                 : pc_gate_open;
 
-            // No-filter publish path: apply the depth-range clip in
-            // place before either downstream consumer reads from the
-            // buffer, so /depth_image and the point-cloud snapshot
-            // see the same clipped raster. The Z14 high 2 bits are
-            // status flags and are stripped before the range test.
-            // The row-0 serial-number watermark is passed through;
-            // it is skipped at reprojection via kSerialSkipPixels
-            // and its presence in /depth_image is by design.
+            // No-filter path: clip in place before either consumer reads the
+            // buffer, so the depth image and the point-cloud snapshot see the same
+            // raster. The Z14 high 2 bits are status flags, stripped before the
+            // range test. The row-0 watermark is cleared after the clip -- its byte
+            // patterns can fall inside the range and would survive as a plausible
+            // short reading.
             if (!any_filter && (depth_gate_open || pc_gate_open)) {
                 constexpr uint16_t kDepthMask = 0x3FFF;
-                const uint16_t z_min_clip = static_cast<uint16_t>(
-                    std::clamp(impl_->max_near_mm, 0.0f, 65535.0f));
-                const uint16_t z_max_clip = static_cast<uint16_t>(
-                    std::clamp(impl_->max_far_mm,  0.0f, 65535.0f));
+                const uint16_t z_near = static_cast<uint16_t>(
+                    std::clamp(impl_->depth_near_mm, 0.0f, 65535.0f));
+                const uint16_t z_far = static_cast<uint16_t>(
+                    std::clamp(impl_->depth_far_mm,  0.0f, 65535.0f));
                 uint16_t* mm = reinterpret_cast<uint16_t*>(fb.data.data());
                 const size_t n = static_cast<size_t>(fb.width) * fb.height;
                 for (size_t i = 0; i < n; ++i) {
                     const uint16_t z = mm[i] & kDepthMask;
-                    mm[i] = (z < z_min_clip || z > z_max_clip) ? 0 : z;
+                    mm[i] = (z < z_near || z > z_far) ? 0 : z;
                 }
+                std::fill_n(mm, kSerialSkipPixels, uint16_t{0});
             }
 
             if (need_snapshot) {
@@ -1305,8 +1576,8 @@ void EspdiDevice::spawn_fetch_threads_() {
         const bool can_reproject = impl_->cached_rect_valid;
         if (!can_reproject) {
             RCLCPP_WARN(logger(),
-                        "Rectify log unavailable: /pointcloud disabled; "
-                        "filtered /depth_image still published");
+                        "Rectify log unavailable: /depth/points disabled; "
+                        "filtered /depth/image_raw still published");
         }
         const size_t pc_points   = static_cast<size_t>(cfg.depth_width) * cfg.depth_height;
         const int    W = cfg.depth_width;
@@ -1317,38 +1588,27 @@ void EspdiDevice::spawn_fetch_threads_() {
         const uint32_t pc_point_step = impl_->colored_pointcloud ? 16u : 12u;
         std::vector<uint8_t> workspace(pc_points * pc_point_step);
 
-        // Filter workspace. pc_q4_buf only exists in the disparity
-        // pipeline; pc_mm_buf is used by every filter (post-ZD-lookup
-        // output for spatial, in-place Z14 mm buffer for the standalone
-        // temporal / hole_filling paths). Sized once at thread start;
-        // unused buffers stay empty. Temporal's enable can flip at
-        // runtime, so the Z-domain branch reuses pc_mm_buf without
-        // reallocating.
+        // Filter workspace, sized once at thread start; unused buffers stay
+        // empty. pc_q4_buf exists only in the disparity pipeline. pc_mm_buf
+        // serves every filter, and the Z-domain branch reuses it without
+        // reallocating because temporal's enable can flip at runtime.
         if (impl_->spatial_filter_enabled) {
             impl_->pc_q4_buf.assign(pc_points, 0);
         }
         impl_->pc_mm_buf.assign(pc_points, 0);
 
-        // Color-pixel byte-offset LUTs. The projection inner loop then
-        // computes a per-pixel color address as two LUT reads plus one
-        // add, with no per-pixel multiplication or division.
-        //
-        // The LUT must match the snapshot's actual width. In wide L|R
-        // split modes the snapshot holds the left-half rgb8 buffer
-        // (width = color_width / 2); the LUT divisor and the row
-        // stride both use that half-width so sampling reads from the
-        // left lens.
+        // Color-pixel byte-offset LUTs: the projection inner loop resolves a
+        // per-pixel colour address with two LUT reads and an add, no multiply
+        // or divide. The LUT must match the snapshot's actual width -- in wide
+        // L|R split modes that is the left half, so the cloud samples the left
+        // lens.
         if (impl_->colored_pointcloud) {
-            // Two widths matter for the LUT and they are not always equal:
-            //   sample_w — pixel range the LUT addresses. Split modes
-            //              restrict this to the left half regardless of
-            //              wire format so the cloud samples the left
-            //              lens only.
-            //   buf_w    — row stride (in pixels) of the snapshot buffer
-            //              that ends up in latest_color. The YUYV split
-            //              path produces a half-width buffer inline (see
-            //              simd::yuyv_to_rgb8_split); the MJPEG path
-            //              decodes the wide frame at its full width.
+            // Two widths, not always equal:
+            //   sample_w  pixel range the LUT addresses; split modes restrict it
+            //             to the left half whatever the wire format.
+            //   buf_w     row stride of the snapshot buffer in latest_color. The
+            //             YUYV split path produces a half-width buffer inline;
+            //             the MJPEG path decodes wide, at full width.
             const bool split_active     = cfg.split_color
                                           && (cfg.color_width % 2 == 0);
             const bool wire_is_mjpeg    = (cfg.color_format == 1);
@@ -1382,8 +1642,8 @@ void EspdiDevice::spawn_fetch_threads_() {
         // Only meaningful when can_reproject; the reprojection block in
         // the main loop is skipped otherwise.
         const auto& rl = impl_->cached_rect;
-        const float ratio_mat = (can_reproject && rl.OutImgHeight > 0)
-            ? static_cast<float>(H) / rl.OutImgHeight
+        const float ratio_mat = can_reproject
+            ? static_cast<float>(raster_scale(impl_->calib.out_height, H))
             : 1.0f;
 
         // Pre-negated LUTs map (u,v) → axis-remapped ROS-base coords:
@@ -1395,16 +1655,11 @@ void EspdiDevice::spawn_fetch_threads_() {
         std::vector<float>    v_inv_neg(H);
         std::vector<uint32_t> row_valid_counts(H, 0);
         std::vector<uint32_t> row_offsets(H, 0);
-        // Conservative upper bound on the stereo left-edge dead-zone
-        // width, evaluated at the configured Z minimum. The actual
-        // dead-zone width is proportional to 1 / Z and shrinks with
-        // farther objects; this fixed bound is used only by the
-        // fill_from_left hole filling mode as left_skip, so that the
-        // dead-zone columns are passed through unchanged instead of
-        // seeding the per-row last_valid state. Columns that turn
-        // out to be valid stereo matches at runtime (when scene Z
-        // exceeds Z_min) keep their values either way — left_skip
-        // never overwrites valid data.
+        // Upper bound on the stereo left-edge dead-zone, evaluated at the
+        // configured Z minimum (the real width goes as 1 / Z). Used only as
+        // fill_from_left's left_skip, which passes those columns through
+        // unchanged instead of seeding the per-row last_valid state;
+        // left_skip never overwrites valid data.
         int dead_zone_left_px = 0;
         if (can_reproject) {
             const float fx = rl.NewCamMat1[0] * ratio_mat;
@@ -1414,8 +1669,8 @@ void EspdiDevice::spawn_fetch_threads_() {
             if (fx == 0.0f || fy == 0.0f) {
                 RCLCPP_ERROR(logger(),
                              "Reprojection LUT init: fx or fy is zero "
-                             "(fx=%.2f fy=%.2f); /pointcloud disabled, "
-                             "filtered /depth_image still published",
+                             "(fx=%.2f fy=%.2f); /depth/points disabled, "
+                             "filtered /depth/image_raw still published",
                              fx, fy);
                 // Continue running for depth publishes; just leave the
                 // reprojection LUTs empty so the loop below skips it.
@@ -1428,7 +1683,7 @@ void EspdiDevice::spawn_fetch_threads_() {
                 for (int v = 0; v < H; ++v) v_inv_neg[v] = -(static_cast<float>(v) - cy) * inv_fy;
 
                 const double baseline_mm = impl_->calib.baseline_mm;
-                const double z_min_mm    = static_cast<double>(impl_->max_near_mm);
+                const double z_min_mm    = static_cast<double>(impl_->depth_near_mm);
                 if (baseline_mm > 0.0 && z_min_mm > 0.0) {
                     dead_zone_left_px = static_cast<int>(
                         std::ceil(baseline_mm * static_cast<double>(fx) / z_min_mm));
@@ -1443,12 +1698,11 @@ void EspdiDevice::spawn_fetch_threads_() {
         }
 
 #ifdef _OPENMP
-        // OMP_WAIT_POLICY and GOMP_SPINCOUNT are set in the launch
-        // environment; libgomp reads them at the first parallel region.
-        // omp_set_num_threads is set here because it overrides the env
-        // and can be changed at runtime. Capped at 4 to limit
-        // over-decomposition on cache-constrained hosts; the floor of 1
-        // covers the rare case where hardware_concurrency() returns 0.
+        // OMP_WAIT_POLICY and GOMP_SPINCOUNT come from the launch environment;
+        // libgomp reads them at the first parallel region. Thread count is set
+        // here because it overrides the environment. Capped at 4 against
+        // over-decomposition on cache-constrained hosts, floored at 1 for a
+        // hardware_concurrency() of 0.
         {
             const unsigned hc = std::thread::hardware_concurrency();
             const int omp_n = std::max(1, std::min(4, static_cast<int>(hc)));
@@ -1469,13 +1723,9 @@ void EspdiDevice::spawn_fetch_threads_() {
             // early-continue check and again at the publish sites later.
             bool need_depth = false;
             bool need_pc    = false;
-            // Filter enable snapshot — taken once at the top of the
-            // iteration so a runtime toggle of temporal_filter between
-            // here and the body cannot leave depth_publish_buf allocated
-            // but unwritten (which would publish a zero-filled depth
-            // frame). hole_fill_mode and spatial_filter_enabled are
-            // launch-only, but capture them too so all three flags are
-            // sampled from a single moment.
+            // All three filter flags are sampled from one moment: a runtime toggle
+            // of temporal_filter mid-iteration would otherwise leave
+            // depth_publish_buf allocated but unwritten, publishing a zero frame.
             const bool snap_spatial  = impl_->spatial_filter_enabled;
             const bool snap_temporal = impl_->temporal_enabled.load(std::memory_order_acquire);
             const bool snap_holes    = impl_->hole_fill_mode != HoleFillMode::kOff;
@@ -1514,20 +1764,9 @@ void EspdiDevice::spawn_fetch_threads_() {
             }
             if (!depth_view) continue;
 
-            // When this iteration is going to publish filtered depth
-            // (filter active AND a depth subscriber exists), allocate
-            // the publish-side byte buffer up front and route the
-            // filter sink into it. Projection reads from the same
-            // buffer; at the end of the loop the buffer is moved into
-            // depth_fb.data with no per-frame copy. When need_depth is
-            // false the filter writes through the persistent pc_mm_buf.
-            //
-            // Invariant: if depth_publish_buf is non-empty here, the
-            // W-spatial or Z-domain filter branch below will fully
-            // overwrite it before the late publish. The branch selector
-            // (spatial vs. z_temporal||z_holes) is exhaustive while
-            // any_filter is true, which is the same gate that produced
-            // need_depth in this code path.
+            // Filter sink and projection source, moved into depth_fb.data at
+            // the end of the loop. Invariant: non-empty here means a filter
+            // branch below fully overwrites it before the publish.
             std::vector<uint8_t> depth_publish_buf;
             uint16_t* filter_mm_sink = impl_->pc_mm_buf.data();
             if (need_depth && impl_->on_depth) {
@@ -1539,15 +1778,12 @@ void EspdiDevice::spawn_fetch_threads_() {
 
             constexpr float    kMmToM    = 1.0f / 1000.0f;
             constexpr uint16_t kDepthMask = 0x3FFF;     // Z14 high 2 bits are flags
-            constexpr int      kSerialSkipPixels = 8;   // 16-byte SN watermark in row 0
-            size_t valid = 0;
+            size_t valid_points = 0;
 
             // Three-step reprojection over the depth raster:
             //   1. count valid pixels per row (parallel, NEON on aarch64)
             //   2. prefix-sum to assign each row a contiguous output slot
-            //   3. project + write compacted (parallel, scalar inner
-            //      loop — empirically faster than a vqtbl2q + vst3q
-            //      NEON kernel on the targeted aarch64 hardware)
+            //   3. project + write compacted (parallel, scalar inner loop)
             // Output is in ROS base convention (X forward, Y left, Z up),
             // metres.
             const uint16_t* d = reinterpret_cast<const uint16_t*>(depth_view->data());
@@ -1561,11 +1797,8 @@ void EspdiDevice::spawn_fetch_threads_() {
                 uint16_t* q4 = impl_->pc_q4_buf.data();
                 uint16_t* mm = filter_mm_sink;
                 disparity_promote_to_q4(d, q4, W, H);
-                // The first kSerialSkipPixels of row 0 are the
-                // firmware serial-number watermark. Mark them as
-                // holes before the neighborhood filters run; the
-                // reprojection loop already skips the same columns
-                // via kSerialSkipPixels.
+                // Mark the watermark columns as holes so the
+                // neighborhood filters never read them as disparity.
                 std::fill_n(q4, kSerialSkipPixels, uint16_t{0});
                 spatial_filter_q4(q4, W, H, impl_->spatial_params);
                 impl_->spatial_filter_total.fetch_add(
@@ -1601,10 +1834,10 @@ void EspdiDevice::spawn_fetch_threads_() {
                 // round-trips unchanged through the downstream
                 // `z & 0x3FFF` mask. The depth-range clip is applied
                 // in mm in the same loop so the boundary is exact.
-                const uint16_t z_min_clip = static_cast<uint16_t>(
-                    std::clamp(impl_->max_near_mm, 0.0f, 65535.0f));
-                const uint16_t z_max_clip = static_cast<uint16_t>(
-                    std::clamp(impl_->max_far_mm,  0.0f, 65535.0f));
+                const uint16_t z_near = static_cast<uint16_t>(
+                    std::clamp(impl_->depth_near_mm, 0.0f, 65535.0f));
+                const uint16_t z_far = static_cast<uint16_t>(
+                    std::clamp(impl_->depth_far_mm,  0.0f, 65535.0f));
                 #pragma omp parallel for schedule(static)
                 for (int v = 0; v < H; ++v) {
                     const uint16_t* qrow = q4 + static_cast<size_t>(v) * W;
@@ -1616,13 +1849,13 @@ void EspdiDevice::spawn_fetch_threads_() {
                         }
                         const uint16_t z = static_cast<uint16_t>(
                             std::clamp(zd_lookup_q4(tbl, qrow[u]), 0, 0x3FFF));
-                        mrow[u] = (z < z_min_clip || z > z_max_clip) ? 0 : z;
+                        mrow[u] = (z < z_near || z > z_far) ? 0 : z;
                     }
                 }
                 d = mm;
 
                 // Z-domain hole filling. Runs after the ZD lookup so
-                // both /depth_image and the reprojected cloud see the
+                // both /depth/image_raw and the reprojected cloud see the
                 // filled raster. dead_zone_left_px gates the
                 // fill_from_left mode only; the around modes are
                 // inherently dead-zone safe and ignore it.
@@ -1638,40 +1871,26 @@ void EspdiDevice::spawn_fetch_threads_() {
                 // Depth publish runs at the end of the loop so the
                 // filter sink can move directly into depth_fb.
             } else {
-                // Z-domain pipeline. spatial_filter is off, but the
-                // temporal and / or hole-filling kernels may still be
-                // enabled on the FW Z14 mm raster. The incoming depth
-                // is copied into a mutable buffer, the requested
-                // kernels run in place, then on_depth is published
-                // here — depth_fetch suppressed its own publish path
-                // because at least one filter is active.
-                // Use the same snapshot as the publish-buffer gate so a
-                // runtime toggle of temporal_filter between the snapshot
-                // and this branch cannot leave depth_publish_buf
-                // allocated but unwritten.
+                // Same snapshot as the publish-buffer gate: a runtime toggle
+                // between the two would leave the buffer allocated but
+                // unwritten.
                 const bool z_temporal = snap_temporal;
                 const bool z_holes    = snap_holes;
                 if (z_temporal || z_holes) {
                     uint16_t* mm = filter_mm_sink;
                     const size_t n = static_cast<size_t>(W) * H;
-                    // Strip the Z14 status bits and clamp to the depth
-                    // clip range in the same pass. Pixels outside
-                    // [z_min_clip, z_max_clip] become 0; downstream
-                    // temporal / hole_filling treat them as holes.
-                    // The spatial path enforces the same range in mm
-                    // domain after the ZD lookup completes.
-                    const uint16_t z_min_clip = static_cast<uint16_t>(
-                        std::clamp(impl_->max_near_mm, 0.0f, 65535.0f));
-                    const uint16_t z_max_clip = static_cast<uint16_t>(
-                        std::clamp(impl_->max_far_mm,  0.0f, 65535.0f));
+                    // Strip the Z14 status bits and clamp to [z_near, z_far] in one pass;
+                    // pixels outside become 0 and downstream filters treat them as holes.
+                    // The spatial path enforces the same range after its ZD lookup.
+                    const uint16_t z_near = static_cast<uint16_t>(
+                        std::clamp(impl_->depth_near_mm, 0.0f, 65535.0f));
+                    const uint16_t z_far = static_cast<uint16_t>(
+                        std::clamp(impl_->depth_far_mm,  0.0f, 65535.0f));
                     for (size_t i = 0; i < n; ++i) {
                         const uint16_t z = d[i] & kDepthMask;
-                        mm[i] = (z < z_min_clip || z > z_max_clip) ? 0 : z;
+                        mm[i] = (z < z_near || z > z_far) ? 0 : z;
                     }
-                    // See the spatial-path comment above: the first
-                    // kSerialSkipPixels of row 0 are the serial-number
-                    // watermark and must not feed any neighborhood
-                    // filter.
+                    // Watermark columns must not feed the kernels below.
                     std::fill_n(mm, kSerialSkipPixels, uint16_t{0});
 
                     if (z_temporal) {
@@ -1706,7 +1925,7 @@ void EspdiDevice::spawn_fetch_threads_() {
                 }
             }
 
-            // Point-cloud reprojection runs only when a /pointcloud
+            // Point-cloud reprojection runs only when a /depth/points
             // subscriber is present; the filtered depth raster still
             // publishes from depth_publish_buf at the end of the loop
             // regardless of whether the cloud is consumed.
@@ -1724,12 +1943,12 @@ void EspdiDevice::spawn_fetch_threads_() {
                         row + u_start, W - u_start);
                 }
 
-                uint32_t running = 0;
+                uint32_t valid_prefix = 0;
                 for (int v = 0; v < H; ++v) {
-                    row_offsets[v] = running;
-                    running += row_valid_counts[v];
+                    row_offsets[v] = valid_prefix;
+                    valid_prefix += row_valid_counts[v];
                 }
-                valid = running;
+                valid_points = valid_prefix;
 
                 // Take a refcount on the most recent color snapshot for the
                 // XYZRGB path. Falls back to XYZ-only when the snapshot is
@@ -1796,37 +2015,40 @@ void EspdiDevice::spawn_fetch_threads_() {
             }
 
             if (need_pc) {
-                if (valid == 0) {
+                if (valid_points == 0) {
                     RCLCPP_WARN_ONCE(logger(),
                                      "PointCloud compaction kept 0 of %zu points "
-                                     "(depth clip [%.0f..%.0f] mm applied upstream)",
+                                     "(depth range [%.0f..%.0f] mm applied upstream)",
                                      pc_points,
-                                     impl_->max_near_mm, impl_->max_far_mm);
+                                     impl_->depth_near_mm, impl_->depth_far_mm);
                 } else if (impl_->on_pc) {
                     // Copy only the populated prefix of the workspace into a
                     // fresh publish buffer. std::vector's (InputIt, InputIt)
                     // constructor uses uninitialized_copy → memcpy for trivial
                     // types, with no intermediate value-init. Workspace itself
                     // is retained for the next iteration.
-                    const size_t valid_bytes = static_cast<size_t>(valid)
+                    const size_t valid_bytes = static_cast<size_t>(valid_points)
                                              * this_point_step;
                     std::vector<uint8_t> msg_buf(workspace.begin(),
                                                  workspace.begin() + valid_bytes);
                     impl_->on_pc(std::move(msg_buf),
-                                 static_cast<uint32_t>(valid),
+                                 static_cast<uint32_t>(valid_points),
                                  this_point_step,
                                  depth_ts);
                 }
             }
 
-            // Publish the filtered depth raster after projection has finished
-            // reading from the same buffer. depth_publish_buf is only non-empty
-            // when the filter pipeline routed its sink there at the top of the
-            // iteration; one of the two filter branches above will have fully
-            // overwritten the buffer by this point. The on_depth check mirrors
-            // the precondition at allocation time and protects against late
-            // teardown.
+            // After projection has finished reading the same buffer.
+            // depth_publish_buf is non-empty only when the filter pipeline routed
+            // its sink there, in which case one of the branches above has fully
+            // overwritten it. The on_depth check mirrors the allocation
+            // precondition and covers a late teardown.
             if (!depth_publish_buf.empty() && impl_->on_depth) {
+                // Re-clear the watermark columns: the pre-filter zeroes them
+                // (marking them as holes), after which a hole-filling kernel
+                // may have refilled them from a neighbour.
+                std::fill_n(reinterpret_cast<uint16_t*>(depth_publish_buf.data()),
+                            kSerialSkipPixels, uint16_t{0});
                 FrameBuffer depth_fb;
                 depth_fb.width  = W;
                 depth_fb.height = H;
@@ -1838,7 +2060,7 @@ void EspdiDevice::spawn_fetch_threads_() {
 
             // Rolling per-frame compute-time stats. Only update when the
             // point-cloud path actually computed something this iteration.
-            if (need_pc && valid > 0) {
+            if (need_pc && valid_points > 0) {
                 const auto t_compute_end = std::chrono::steady_clock::now();
                 const uint64_t us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                         t_compute_end - t_compute_begin).count());
@@ -1876,6 +2098,35 @@ EspdiDevice::StreamState EspdiDevice::stream_state() const {
     return impl_->stream_state.load(std::memory_order_relaxed);
 }
 
+bool EspdiDevice::reset_usb() {
+    std::lock_guard<std::mutex> sdk_lk(impl_->sdk_mtx);
+    if (!impl_->opened || !impl_->handle) return false;
+
+    // eSP876 USB self-reset register sequence, {address, value}. The
+    // leading writes reconfigure the link; the final write (0xF01E) drops
+    // it, so the host re-enumerates the device as if it had been replugged.
+    // Two-byte address, one-byte value, matching the DM_Quality register
+    // writes in register_settings.cpp.
+    struct ResetReg { unsigned short addr; unsigned char val; };
+    static constexpr ResetReg kResetSeq[] = {
+        {0xF069, 0xF3}, {0xF0B0, 0x00}, {0xF0D2, 0x80}, {0xF0D2, 0x00},
+        {0xF11A, 0x44}, {0xF11A, 0x40}, {0xF0F0, 0x00}, {0xF0FC, 0x20},
+        {0xF0FC, 0x00}, {0xF0E0, 0x00}, {0xF500, 0x40}, {0xF500, 0x00},
+        {0xF01E, 0x45},
+    };
+    const int flags = FG_Address_2Byte | FG_Value_1Byte;
+    // The detach-triggering tail writes are acknowledged unreliably, so
+    // individual results are ignored — a missing ack on the write that
+    // drops the link is expected, not a failure.
+    for (const auto& r : kResetSeq)
+        APC_SetHWRegister(impl_->handle, &impl_->sel, r.addr, r.val, flags);
+
+    RCLCPP_INFO(logger(),
+                "reset_usb: USB self-reset issued; the link will drop and the "
+                "watchdog will reopen the device");
+    return true;
+}
+
 EspdiDevice::Stats EspdiDevice::stats() const {
     Stats s;
     s.color_input_total    = impl_->color_input_total.load(std::memory_order_relaxed);
@@ -1906,12 +2157,11 @@ std::string EspdiDevice::usb_port() const {
 int         EspdiDevice::actual_fps()        const { return impl_->actual_fps.load(std::memory_order_relaxed); }
 
 bool EspdiDevice::pause(bool on) {
-    // Pause flips stream_state; fetch threads keep running, drain USB,
-    // and skip decode/filter/publish on the next iteration. Resume is
-    // observed on the next frame (~33 ms @ 30 fps).
-    //
-    // Shares lifecycle_mtx with standby() so the two cannot race;
-    // sub-µs uncontended and pause is not a hot-path control.
+    if (selfcal_reject("pause")) return false;
+    // Flips stream_state; the fetch threads keep draining USB and skip
+    // decode/filter/publish on the next iteration, so a resume is observed
+    // one frame later. Shares lifecycle_mtx with standby() so the two
+    // cannot race.
     std::lock_guard<std::mutex> lifecycle_lk(impl_->lifecycle_mtx);
     const StreamState cur = impl_->stream_state.load(std::memory_order_relaxed);
     if (cur == StreamState::Standby) {
@@ -1928,6 +2178,7 @@ bool EspdiDevice::pause(bool on) {
 }
 
 bool EspdiDevice::standby(bool on) {
+    if (selfcal_reject("standby")) return false;
     std::lock_guard<std::mutex> lifecycle_lk(impl_->lifecycle_mtx);
     if (!impl_->opened || !impl_->handle) return false;
     const StreamState cur = impl_->stream_state.load(std::memory_order_relaxed);
@@ -1947,12 +2198,13 @@ bool EspdiDevice::standby(bool on) {
         if (impl_->color_fetch.joinable()) impl_->color_fetch.join();
         if (impl_->depth_fetch.joinable()) impl_->depth_fetch.join();
         if (impl_->pc_thread.joinable())   impl_->pc_thread.join();
-        // Join the DM_Quality register-apply worker as well. It is spawned
-        // from the first-depth-frame trigger and writes to the SDK handle;
-        // if it is still in flight when APC_CloseDevice runs the writes
-        // race the close, and on the next standby(false) the residual
-        // writes hit the new session.
-        if (impl_->dm_quality_worker.joinable()) impl_->dm_quality_worker.join();
+        // Join the DM_Quality worker too — it writes to the SDK handle, so it
+        // must not outlive APC_CloseDevice. Under dm_quality_mtx (uncontended —
+        // the fetch threads are joined above).
+        {
+            std::lock_guard<std::mutex> dmq_lk(impl_->dm_quality_mtx);
+            if (impl_->dm_quality_worker.joinable()) impl_->dm_quality_worker.join();
+        }
         {
             // Drop the staged depth pointer (open()-symmetric reset) so a
             // stale frame cannot republish across a Standby cycle. The
@@ -1979,13 +2231,12 @@ bool EspdiDevice::standby(bool on) {
         return true;
     }
 
-    // Standby -> Active|Paused. Replay the same SDK init sequence as
-    // open() (minus APC_Init / APC_GetDeviceInfo / GetRectifyMatLogData,
-    // which survive APC_CloseDevice). Order matters: SetupBlock and
-    // SetDepthDataType must precede SetInterleaveMode; v4l2_requestbuffers
-    // must precede OpenDevice2 so the V4L2 queue is large enough for the
-    // configured fps. Missing the requestbuffers step caps the depth pump
-    // at the default ~3-buffer queue and frames stall.
+    // Standby -> Active|Paused. Replays open()'s SDK init sequence, minus
+    // APC_Init / APC_GetDeviceInfo / GetRectifyMatLogData, which survive
+    // APC_CloseDevice. Order matters: SetupBlock and SetDepthDataType
+    // before SetInterleaveMode, and v4l2_requestbuffers before
+    // OpenDevice2 -- without it the V4L2 queue stays at its ~3-buffer
+    // default and the depth pump stalls.
     const auto& cfg = impl_->cfg;
     APC_SetupBlock(impl_->handle, &impl_->sel, false);
     if (impl_->depth_stream_present) {
@@ -1993,8 +2244,8 @@ bool EspdiDevice::standby(bool on) {
             impl_->handle, &impl_->sel, cfg.depth_data_type);
         if (dtype_rc != APC_OK) {
             RCLCPP_WARN(logger(),
-                        "standby(false): APC_SetDepthDataType(%d) rc=%d",
-                        cfg.depth_data_type, dtype_rc);
+                        "standby(false): APC_SetDepthDataType(%d) %s",
+                        cfg.depth_data_type, espdi_strerror(dtype_rc).c_str());
         }
     }
     // 32 V4L2 buffers — same headroom that open() requests; without this
@@ -2006,25 +2257,26 @@ bool EspdiDevice::standby(bool on) {
             impl_->handle, &impl_->sel, 32);
         if (rb_rc != APC_OK) {
             RCLCPP_WARN(logger(),
-                        "standby(false): APC_Setup_v4l2_requestbuffers(32) rc=%d",
-                        rb_rc);
+                        "standby(false): APC_Setup_v4l2_requestbuffers(32) %s",
+                        espdi_strerror(rb_rc).c_str());
         }
     }
     if (cfg.interleave) {
         const int il_rc = APC_SetInterleaveMode(impl_->handle, &impl_->sel, true);
         if (il_rc != APC_OK) {
             RCLCPP_WARN(logger(),
-                        "standby(false): APC_SetInterleaveMode(true) rc=%d", il_rc);
+                        "standby(false): APC_SetInterleaveMode(true) %s", espdi_strerror(il_rc).c_str());
         }
     }
     // Apply IR before APC_OpenDevice2 so the V4L2 capture buffer fills at
-    // the configured illumination from the first frame. Same convention as
-    // open(); a runtime ir_intensity override is re-applied separately by
-    // the standby service handler after this function returns.
+    // the configured illumination from the first frame. ir_default_level
+    // carries open()'s mode-resolved default; a runtime ir_value
+    // override is re-applied separately by the standby service handler
+    // after this function returns.
     {
-        const int level = (cfg.ir_intensity >= 0)
-            ? cfg.ir_intensity
-            : default_ir_level_for_pid(impl_->dev_info.wPID);
+        const int level = (cfg.ir_value >= 0)
+            ? cfg.ir_value
+            : impl_->ir_default_level;
         APC_SetCurrentIRValue(impl_->handle, &impl_->sel,
                               static_cast<unsigned short>(level));
     }
@@ -2037,12 +2289,12 @@ bool EspdiDevice::standby(bool on) {
         impl_->handle, &impl_->sel,
         cw, ch, static_cast<bool>(cfg.color_format),
         dw, dh, DEPTH_IMG_NON_TRANSFER,
-        /*bIsOutputRGB24=*/true, /*phWndNotice=*/nullptr,
+        /*bIsOutputRGB24=*/false, /*phWndNotice=*/nullptr,
         &actual_fps, IMAGE_SN_SYNC);
     if (rc != APC_OK) {
         RCLCPP_ERROR(logger(),
-                     "standby(false): APC_OpenDevice2(c=%dx%d, d=%dx%d) failed rc=%d ; device closed",
-                     cw, ch, dw, dh, rc);
+                     "standby(false): APC_OpenDevice2(c=%dx%d, d=%dx%d) failed: %s ; device closed",
+                     cw, ch, dw, dh, espdi_strerror(rc).c_str());
         impl_->opened = false;
         return false;
     }
@@ -2089,32 +2341,219 @@ void EspdiDevice::stop() {
         join_named(impl_->depth_fetch, "depth_fetch");
         join_named(impl_->pc_thread,   "pc_thread");
     }
-    join_named(impl_->dm_quality_worker, "dm_quality_worker");
+    // Under dm_quality_mtx (uncontended here — the fetch threads are joined
+    // above).
+    {
+        std::lock_guard<std::mutex> dmq_lk(impl_->dm_quality_mtx);
+        join_named(impl_->dm_quality_worker, "dm_quality_worker");
+    }
 }
 
 EspdiDevice::Calibration EspdiDevice::calibration() const {
     return impl_->calib;
 }
 
+// The gate std::functions are read lock-free on the per-frame hot path, so
+// they may only be assigned while stopped. Every caller sets them before
+// start(); the setters reject a call made while streaming.
+bool EspdiDevice::gate_setter_allowed(const char* which) {
+    if (impl_->running.load(std::memory_order_acquire)) {
+        RCLCPP_ERROR(logger(),
+                     "%s called while streaming; ignoring to avoid a torn "
+                     "std::function read on the fetch threads", which);
+        return false;
+    }
+    return true;
+}
+
+bool EspdiDevice::selfcal_active() const {
+    return impl_->selfcal_ && impl_->selfcal_->active();
+}
+
+bool EspdiDevice::selfcal_reject(const char* which) {
+    if (selfcal_active()) {
+        RCLCPP_WARN(logger(),
+                    "%s refused: a self-calibration session is in progress",
+                    which);
+        return true;
+    }
+    return false;
+}
+
+bool EspdiDevice::selfcal_available() const {
+    return impl_->selfcal_ && impl_->selfcal_->available();
+}
+
+// eSP876 cy_R (right-imager vertical) live register: 0xF56A low byte, 0xF56B high
+// byte, 1-byte values. This is the only register a cy session dithers.
+namespace {
+constexpr unsigned short kRegCyLow  = 0xF56A;
+constexpr unsigned short kRegCyHigh = 0xF56B;
+}  // namespace
+
+bool EspdiDevice::get_cy_regs(unsigned short& lo, unsigned short& hi) {
+    std::lock_guard<std::mutex> sdk_lk(impl_->sdk_mtx);
+    if (!impl_->opened || !impl_->handle) return false;
+    unsigned short l = 0, h = 0;
+    const int r1 = APC_GetHWRegister(impl_->handle, &impl_->sel, kRegCyLow, &l,
+                                     FG_Address_2Byte | FG_Value_1Byte);
+    const int r2 = APC_GetHWRegister(impl_->handle, &impl_->sel, kRegCyHigh, &h,
+                                     FG_Address_2Byte | FG_Value_1Byte);
+    if (r1 != APC_OK || r2 != APC_OK) {
+        RCLCPP_WARN(logger(), "cy read failed: %s / %s",
+                    espdi_strerror(r1).c_str(), espdi_strerror(r2).c_str());
+        return false;
+    }
+    lo = l;
+    hi = h;
+    return true;
+}
+
+bool EspdiDevice::set_cy_regs(unsigned short lo, unsigned short hi) {
+    std::lock_guard<std::mutex> sdk_lk(impl_->sdk_mtx);
+    if (!impl_->opened || !impl_->handle) return false;
+    const int r1 = APC_SetHWRegister(impl_->handle, &impl_->sel, kRegCyLow, lo,
+                                     FG_Address_2Byte | FG_Value_1Byte);
+    const int r2 = APC_SetHWRegister(impl_->handle, &impl_->sel, kRegCyHigh, hi,
+                                     FG_Address_2Byte | FG_Value_1Byte);
+    if (r1 != APC_OK || r2 != APC_OK) {
+        RCLCPP_WARN(logger(), "cy write failed: %s / %s",
+                    espdi_strerror(r1).c_str(), espdi_strerror(r2).c_str());
+        return false;
+    }
+    return true;
+}
+
+bool EspdiDevice::snapshot_cy() {
+    unsigned short lo = 0, hi = 0;
+    if (!get_cy_regs(lo, hi)) {
+        impl_->cy_snapshot_valid = false;
+        return false;
+    }
+    impl_->cy_snapshot_lo = lo;
+    impl_->cy_snapshot_hi = hi;
+    impl_->cy_snapshot_valid = true;
+    return true;
+}
+
+bool EspdiDevice::restore_cy() {
+    if (!impl_->cy_snapshot_valid) return false;
+    if (!set_cy_regs(impl_->cy_snapshot_lo, impl_->cy_snapshot_hi)) return false;
+    RCLCPP_INFO(logger(), "cy register restored to the pre-session value");
+    return true;
+}
+
+bool EspdiDevice::start_selfcal(const std::string& profile) {
+    if (!impl_->selfcal_ || !impl_->selfcal_->available()) {
+        RCLCPP_WARN(logger(), "start_selfcal: self-calibration is not available");
+        return false;
+    }
+    // No G2 user bank (0xF6=0) -> nowhere to commit; self-cal unsupported.
+    if (impl_->calib_bank_offset != 5) {
+        RCLCPP_WARN(logger(),
+                    "start_selfcal: this module has no G2 user bank (0xF6=0); "
+                    "self-calibration is not supported");
+        return false;
+    }
+    if (!impl_->running.load(std::memory_order_acquire)) {
+        RCLCPP_WARN(logger(),
+                    "start_selfcal: the device must be streaming a depth mode");
+        return false;
+    }
+    // The pause gate in depth_fetch returns before the selfcal feed, so a
+    // session started here would only ever time out.
+    if (impl_->stream_state.load(std::memory_order_relaxed) != StreamState::Active) {
+        RCLCPP_WARN(logger(),
+                    "start_selfcal: the stream is paused; resume before calibrating");
+        return false;
+    }
+    if (!impl_->depth_stream_present) {
+        RCLCPP_WARN(logger(),
+                    "start_selfcal: the active mode delivers no depth stream");
+        return false;
+    }
+    // Snapshot cy before the search starts so a worse or abandoned run can be
+    // rolled back. Refuse to start without it, rather than run an undoable
+    // session.
+    if (!snapshot_cy()) {
+        RCLCPP_WARN(logger(), "start_selfcal: cannot snapshot cy; refusing");
+        return false;
+    }
+    // Commit target = the mode's G2 slot (zd_index + the 0xF6 offset, 5).
+    const int flash_index = impl_->cfg.zd_index + impl_->calib_bank_offset;
+    // Hand the pre-session cy to the manager so its A/B re-check can measure the
+    // "before" fill-rate at exactly the snapshotted value.
+    if (!impl_->selfcal_->start(profile, flash_index,
+                                impl_->cy_snapshot_lo, impl_->cy_snapshot_hi)) {
+        impl_->cy_snapshot_valid = false;
+        return false;
+    }
+    return true;
+}
+
+bool EspdiDevice::stop_selfcal() {
+    if (!impl_->selfcal_) return false;
+    impl_->selfcal_->stop();
+    return true;
+}
+
+bool EspdiDevice::revert_selfcal() {
+    // Roll the cy register back to its pre-session value and end the session.
+    // Stop first (the SDK writes its stable value), then restore ours so it
+    // wins. Clears the snapshot so close() does not roll back again.
+    stop_selfcal();
+    const bool ok = restore_cy();
+    // Only on success: a discarded snapshot also disables close()'s rollback.
+    if (ok) impl_->cy_snapshot_valid = false;
+    return ok;
+}
+
+bool EspdiDevice::commit_selfcal() {
+    if (!impl_->selfcal_) return false;
+    const bool ok = impl_->selfcal_->commit();  // CommitToFlash (must precede Stop)
+    if (ok) {
+        impl_->selfcal_->stop();                // finalize the session
+        // Committed to flash: the live value is the intended one; drop the
+        // snapshot so it is not rolled back.
+        impl_->cy_snapshot_valid = false;
+    }
+    return ok;
+}
+
+void EspdiDevice::keep_selfcal() {
+    // Keep the converged value live; leave the session completed so a later
+    // commit_selfcal() works (CommitToFlash precedes Stop). Drop the snapshot
+    // (close() must not roll back) and the control gate (the worker held it up
+    // to here).
+    impl_->cy_snapshot_valid = false;
+    if (impl_->selfcal_) impl_->selfcal_->clear_active();
+}
+
+SelfCalManager::Status EspdiDevice::selfcal_status() const {
+    if (!impl_->selfcal_) return {};
+    return impl_->selfcal_->status();
+}
+
 void EspdiDevice::set_pc_gate(PointCloudGate gate) {
-    // The PC thread reads pc_gate without locking. The function-object copy
-    // is small; a torn read can at worst produce one misclassified iteration,
-    // which is acceptable on this path.
+    if (!gate_setter_allowed("set_pc_gate")) return;
     impl_->pc_gate = std::move(gate);
 }
 
 void EspdiDevice::set_color_gate(FrameStreamGate gate) {
+    if (!gate_setter_allowed("set_color_gate")) return;
     impl_->color_gate = std::move(gate);
 }
 
 void EspdiDevice::set_depth_gate(FrameStreamGate gate) {
+    if (!gate_setter_allowed("set_depth_gate")) return;
     impl_->depth_gate = std::move(gate);
 }
 
-bool EspdiDevice::set_ir_intensity(int value) {
+bool EspdiDevice::set_ir_value(int value) {
     std::lock_guard<std::mutex> sdk_lk(impl_->sdk_mtx);
     if (!impl_->opened || !impl_->handle) return false;
-    // Negative value = use per-PID default resolved at open().
+    if (selfcal_reject("set_ir_value")) return false;
+    // Negative value = use the mode-resolved default from open().
     const char* origin = "explicit";
     if (value < 0) {
         value = impl_->ir_default_level;
@@ -2122,19 +2561,19 @@ bool EspdiDevice::set_ir_intensity(int value) {
     }
     if (impl_->ir_range_valid && value > impl_->ir_max_fw) {
         RCLCPP_WARN(logger(),
-                    "ir_intensity=%d exceeds FW max %d ; clamping",
+                    "ir_value=%d exceeds FW max %d ; clamping",
                     value, impl_->ir_max_fw);
         value = impl_->ir_max_fw;
     }
-    const unsigned short v = static_cast<unsigned short>(value);
-    const int rc = APC_SetCurrentIRValue(impl_->handle, &impl_->sel, v);
+    const unsigned short ir_level = static_cast<unsigned short>(value);
+    const int rc = APC_SetCurrentIRValue(impl_->handle, &impl_->sel, ir_level);
     if (rc != APC_OK) {
         RCLCPP_WARN(logger(),
-                    "APC_SetCurrentIRValue(%u) rc=%d", v, rc);
+                    "APC_SetCurrentIRValue(%u) %s", ir_level, espdi_strerror(rc).c_str());
         return false;
     }
     RCLCPP_INFO(logger(),
-                "ir_intensity -> %u (%s)", v, origin);
+                "ir_value -> %u (%s)", ir_level, origin);
     return true;
 }
 
@@ -2168,8 +2607,8 @@ EspdiDevice::TemperatureReading EspdiDevice::read_temperature() const {
     const uint32_t swapped =
         ((static_cast<uint32_t>(reg) >> 8) & 0x00FFu) |
         ((static_cast<uint32_t>(reg) << 8) & 0xFF00u);
-    const uint32_t v = (swapped >> 5) & 0x7FFu;        // 11 bits
-    const int32_t  signed11 = static_cast<int32_t>(v ^ 0x400u) - 0x400;
+    const uint32_t temp_raw11 = (swapped >> 5) & 0x7FFu;   // 11 bits
+    const int32_t  signed11 = static_cast<int32_t>(temp_raw11 ^ 0x400u) - 0x400;
     t.celsius = static_cast<float>(signed11) * 0.125f;
     t.read_ok = true;
     return t;
@@ -2182,8 +2621,8 @@ bool EspdiDevice::set_temporal_filter(bool enabled, double alpha,
     // otherwise). delta is stored raw here and converted at the
     // pc_thread call site so the same field serves both pipelines.
     TemporalFilterParams tp;
-    const double a = std::clamp(alpha, 0.0, 1.0);
-    tp.alpha_q8    = static_cast<int>(std::lround(a * 256.0));
+    const double alpha_clamped = std::clamp(alpha, 0.0, 1.0);
+    tp.alpha_q8    = static_cast<int>(std::lround(alpha_clamped * 256.0));
     // Clamp keeps the Q4 promote (`<<= 4`) inside uint16.
     tp.delta       = std::clamp(delta, 1, 4095);
     tp.persistence = std::clamp(persistence, 0, 8);
@@ -2201,7 +2640,7 @@ bool EspdiDevice::set_temporal_filter(bool enabled, double alpha,
     RCLCPP_INFO(logger(),
                 "Temporal filter %s: alpha=%.2f delta=%d persistence=%d (%s domain)%s",
                 enabled ? "ON" : "OFF",
-                a, delta, tp.persistence,
+                alpha_clamped, delta, tp.persistence,
                 impl_->spatial_filter_enabled ? "D11 disparity" : "Z14 mm",
                 (enabled && !was_enabled) ? " (history reset)" : "");
     return true;
@@ -2210,6 +2649,7 @@ bool EspdiDevice::set_temporal_filter(bool enabled, double alpha,
 bool EspdiDevice::set_auto_exposure(bool enable) {
     std::lock_guard<std::mutex> sdk_lk(impl_->sdk_mtx);
     if (!impl_->opened || !impl_->handle) return false;
+    if (selfcal_reject("set_auto_exposure")) return false;
     // Auto-exposure is switched via the UVC CT AUTO_EXPOSURE_MODE register:
     //   manual = 1 (AE_MOD_MANUAL_MODE)
     //   auto   = 3 (AE_MOD_APERTURE_PRIORITY_MODE)
@@ -2221,8 +2661,8 @@ bool EspdiDevice::set_auto_exposure(bool enable) {
                                     CT_PROPERTY_ID_AUTO_EXPOSURE_MODE_CTRL, mode);
     if (rc != APC_OK) {
         RCLCPP_WARN(logger(),
-                    "APC_SetCTPropVal(AE_MODE, %s) rc=%d",
-                    enable ? "auto" : "manual", rc);
+                    "APC_SetCTPropVal(AE_MODE, %s) %s",
+                    enable ? "auto" : "manual", espdi_strerror(rc).c_str());
         return false;
     }
     RCLCPP_INFO(logger(), "auto_exposure -> %s",
@@ -2233,6 +2673,7 @@ bool EspdiDevice::set_auto_exposure(bool enable) {
 bool EspdiDevice::set_exposure_time_step(int step) {
     std::lock_guard<std::mutex> sdk_lk(impl_->sdk_mtx);
     if (!impl_->opened || !impl_->handle) return false;
+    if (selfcal_reject("set_exposure_time_step")) return false;
     // Manual exposure is applied via UVC CT EXPOSURE_TIME_ABSOLUTE. The value
     // is a signed log-step (negative = darker, positive = brighter).
     // Effective only when auto-exposure is set to manual.
@@ -2241,7 +2682,8 @@ bool EspdiDevice::set_exposure_time_step(int step) {
                                     static_cast<long int>(step));
     if (rc != APC_OK) {
         RCLCPP_WARN(logger(),
-                    "APC_SetCTPropVal(EXPOSURE_TIME_ABSOLUTE, %d) rc=%d", step, rc);
+                    "APC_SetCTPropVal(EXPOSURE_TIME_ABSOLUTE, %d) %s", step,
+                    espdi_strerror(rc).c_str());
         return false;
     }
     RCLCPP_INFO(logger(), "exposure_time_step -> %d", step);
@@ -2251,6 +2693,7 @@ bool EspdiDevice::set_exposure_time_step(int step) {
 bool EspdiDevice::set_auto_white_balance(bool enable) {
     std::lock_guard<std::mutex> sdk_lk(impl_->sdk_mtx);
     if (!impl_->opened || !impl_->handle) return false;
+    if (selfcal_reject("set_auto_white_balance")) return false;
     // Auto white-balance is switched via the UVC PU WHITE_BALANCE_AUTO_CTRL
     // register. On most depth-camera firmware AWB is fixed at the hardware
     // level: the setter returns success but the live state does not change.
@@ -2259,8 +2702,8 @@ bool EspdiDevice::set_auto_white_balance(bool enable) {
                                     enable ? 1 : 0);
     if (rc != APC_OK) {
         RCLCPP_WARN(logger(),
-                    "APC_SetPUPropVal(AWB_AUTO, %s) rc=%d",
-                    enable ? "on" : "off", rc);
+                    "APC_SetPUPropVal(AWB_AUTO, %s) %s",
+                    enable ? "on" : "off", espdi_strerror(rc).c_str());
         return false;
     }
     RCLCPP_INFO(logger(), "auto_white_balance -> %s",
@@ -2271,9 +2714,11 @@ bool EspdiDevice::set_auto_white_balance(bool enable) {
 bool EspdiDevice::set_power_line_frequency(int mode) {
     std::lock_guard<std::mutex> sdk_lk(impl_->sdk_mtx);
     if (!impl_->opened || !impl_->handle) return false;
-    if (mode < 0 || mode > 3) {
+    if (selfcal_reject("set_power_line_frequency")) return false;
+    // Firmware only supports 50/60 Hz; UVC 0 (off) and 3 (auto) are rejected.
+    if (mode != 1 && mode != 2) {
         RCLCPP_WARN(logger(),
-                    "set_power_line_frequency: mode must be 0/1/2/3, got %d", mode);
+                    "set_power_line_frequency: mode must be 1 (50Hz) or 2 (60Hz), got %d", mode);
         return false;
     }
     const int rc = APC_SetPUPropVal(impl_->handle, &impl_->sel,
@@ -2281,12 +2726,11 @@ bool EspdiDevice::set_power_line_frequency(int mode) {
                                     mode);
     if (rc != APC_OK) {
         RCLCPP_WARN(logger(),
-                    "APC_SetPUPropVal(POWER_LINE_FREQ, %d) rc=%d", mode, rc);
+                    "APC_SetPUPropVal(POWER_LINE_FREQ, %d) %s", mode,
+                    espdi_strerror(rc).c_str());
         return false;
     }
-    const char* label = (mode == 0) ? "disabled"
-                      : (mode == 1) ? "50Hz"
-                      : (mode == 2) ? "60Hz" : "auto";
+    const char* label = (mode == 1) ? "50Hz" : "60Hz";
     RCLCPP_INFO(logger(),
                 "power_line_frequency -> %d (%s)", mode, label);
     return true;
@@ -2299,7 +2743,7 @@ EspdiDevice::RuntimeState EspdiDevice::read_runtime_state() const {
 
     unsigned short ir_cur = 0;
     if (APC_GetCurrentIRValue(impl_->handle, &impl_->sel, &ir_cur) == APC_OK) {
-        s.ir_intensity = static_cast<int>(ir_cur);
+        s.ir_value = static_cast<int>(ir_cur);
         s.ir_read_ok = true;
     }
     long int ae_mode = 0;
@@ -2331,6 +2775,9 @@ EspdiDevice::RuntimeState EspdiDevice::read_runtime_state() const {
 }
 
 void EspdiDevice::apply_dm_quality_register_setting_async(const std::string& cfg_dir) {
+    // Runs on the depth-fetch thread. Guard the opened/handle read and the
+    // worker join/spawn with dm_quality_mtx (see the member comment).
+    std::lock_guard<std::mutex> dmq_lk(impl_->dm_quality_mtx);
     if (!impl_->opened || impl_->handle == nullptr) {
         RCLCPP_WARN(logger(),
                     "apply_dm_quality_register_setting_async: device not open, skipping");

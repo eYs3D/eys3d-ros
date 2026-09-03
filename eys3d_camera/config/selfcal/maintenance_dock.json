@@ -1,0 +1,84 @@
+{
+  "schema_version": 2,
+  "profile_name": "maintenance_dock",
+  "session": {
+    "mode": "one_shot",
+    "maximum_duration_sec": 20.0,
+    "stop_when_converged": true
+  },
+  "input": {
+    "minimum_valid_ratio": 0.025,
+    "minimum_frame_count": 5
+  },
+  "algorithm": {
+    "acquisition_search_radius_steps": 5,
+    "tracking_search_radius_steps": 1,
+    "auto_adjust_period": true,
+    "acquisition_update_period_sec": 1.0,
+    "tracking_update_period_sec": 86400.0,
+    "sample_period_sec": 0.15,
+    "temperature_trigger_delta_c": 1.0,
+    "valid_sample_ratio": 0.025,
+    "dynamic_search_radius": true,
+    "maximum_correction": 5.0,
+    "estimator": "confidence_weighted_ranking",
+    "ignored_left_region_ratio": 0.0,
+    "tracking_entry_quality": 0.98,
+    "convergence_count": 1,
+    "maximum_acquisition_iterations": 30,
+    "smoothing_factor": 0.0,
+    "random_sampling": false,
+    "tracking_stable_range": 0.25,
+    "tracking_failure_count": 3,
+    "minimum_valid_candidates": 2,
+    "search_step": 0.25,
+    "hardware_scale": 4.0,
+    "acquisition_refinement": {
+      "enabled": true,
+      "search_radius_steps": 1,
+      "update_period_sec": 0.5,
+      "sample_period_sec": 0.15,
+      "convergence_count": 1,
+      "maximum_iterations": 8,
+      "time_budget_sec": 5.0,
+      "dynamic_search_radius": false,
+      "minimum_valid_candidates": 2,
+      "search_step": 0.25,
+      "fallback_policy": "use_coarse_result"
+    }
+  },
+  "thermal_correction": {
+    "enabled": false,
+    "calibration_temperature_c": 25.0,
+    "correction_rate": 0.0,
+    "initial_update_period_sec": 0.5,
+    "runtime_update_period_sec": 30.0
+  },
+  "flash": {
+    "enabled": true,
+    "rectify_table_index": 5,
+    "verify_after_write": true,
+    "rollback_on_verify_failure": true,
+    "readback_tolerance": 0.01
+  },
+  "logging": {
+    "event_log": {
+      "enabled": false,
+      "path": "selfcal_maintenance_events.jsonl",
+      "flush_each_event": true
+    },
+    "calibration_history": {
+      "enabled": true,
+      "path": "selfcal_calibration_history.jsonl",
+      "flush_each_record": true,
+      "record_runtime_updates": false,
+      "include_parameter_values": true
+    },
+    "debug_log": {
+      "enabled": false,
+      "path": "selfcal_debug.log",
+      "flush_each_line": true,
+      "frame_heartbeat_period_sec": 2.0
+    }
+  }
+}

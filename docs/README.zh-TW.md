@@ -22,19 +22,38 @@ Foxy、Humble、Jazzy。
 ## 安裝
 
 ```bash
-sudo apt install ros-$ROS_DISTRO-diagnostic-updater
+sudo apt install ros-$ROS_DISTRO-diagnostic-updater \
+                 ros-$ROS_DISTRO-robot-state-publisher ros-$ROS_DISTRO-xacro \
+                 ros-$ROS_DISTRO-rviz2
 ```
 
-將此 package 放入 workspace 的 `src/` 後建置：
+per-model launch 預設 `urdf:=true` 與 `rviz:=true`，缺少
+`robot_state_publisher`、`xacro`、`rviz2` 會無法啟動；加上
+`urdf:=false rviz:=false` 則不需要。
+
+請將 `eys3d_camera` 與 `eys3d_camera_interfaces`（自我校正 action 的定義）
+兩個 package 一併放入 workspace 的 `src/` 後建置；`--packages-up-to` 會先
+建置 interfaces：
 
 ```bash
 cd ~/ros2_ws
-colcon build --packages-select eys3d_camera --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon build --packages-up-to eys3d_camera --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
 
-per-model launch 預設會開啟 RViz；安裝一次
-`sudo apt install ros-$ROS_DISTRO-rviz2`，或加 `rviz:=false` 略過視覺化。
+
+### 裝置權限
+
+驅動以一般使用者身分開啟相機。若開啟裝置時出現權限錯誤，安裝隨附的
+udev 規則，讓 eSPDI SDK 能存取該 USB 裝置：
+
+```bash
+sudo cp install/eys3d_camera/share/eys3d_camera/udev/99-eys3d.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+然後重新插拔相機。此規則授予對 eYs3D 裝置（USB vendor `3438`）的
+存取權限；或將使用者加入 `video` 群組後重新登入。
 
 ---
 
@@ -57,12 +76,29 @@ ros2 launch eys3d_camera G62.launch.py       # G62: L'+D 640x480 @ 25 fps
 
 | Topic | 型別 | 說明 |
 |---|---|---|
-| `/G100P_1/left_color` | `sensor_msgs/Image` | 左眼彩色影像，固定 `rgb8`（YUYV 與 MJPEG 來源皆 inline 解碼為 RGB888；灰階感測模組以 R=G=B 輸出）。是否經過校正取決於當前的 video mode。|
-| `/G100P_1/right_color` | `sensor_msgs/Image` | 右眼彩色影像；僅在 video mode 帶有 L\|R 並排輸出時發布（`split_lr: true`）|
-| `/G100P_1/depth_image` | `sensor_msgs/Image` (`16UC1`，mm，REP-118) | 深度（毫米） |
-| `/G100P_1/pointcloud` | `sensor_msgs/PointCloud2` | XYZ float32，已轉換為 ROS 基底軸（公尺）；當 `colored_pointcloud:=true` 時改為 XYZRGB |
+| `/G100P_1/left_color/image_raw` | `sensor_msgs/Image` | 左眼彩色影像，固定 `rgb8`（YUYV 與 MJPEG 來源皆 inline 解碼為 RGB888；灰階感測模組以 R=G=B 輸出）。是否經過校正取決於當前的 video mode。|
+| `/G100P_1/right_color/image_raw` | `sensor_msgs/Image` | 右眼彩色影像；僅在 video mode 帶有 L\|R 並排輸出時發布（`split_lr: true`）|
+| `/G100P_1/depth/image_raw` | `sensor_msgs/Image` (`16UC1`，mm，REP-118) | 深度（毫米） |
+| `/G100P_1/depth/points` | `sensor_msgs/PointCloud2` | XYZ float32，已轉換為 ROS 基底軸（公尺）；當 `colored_pointcloud:=true` 時改為 XYZRGB |
 | `/G100P_1/<stream>/camera_info` | `sensor_msgs/CameraInfo` | 相機內參，每張 Image 一張（`header.stamp` 相同） |
 | `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | 健康狀態，1 Hz |
+
+### CameraInfo 與畸變係數
+
+每一份 `camera_info` 描述的都是它自己 topic 上發布的那張影像。
+
+深度在所有模式下都是已校正的;彩色則在目錄名稱帶撇號的模式下已校正
+(`L'+D`、`L'+R'+D`)。那些 topic 上的 `k` 是 `p` 的左 3×3、`d` 為零
+(`plumb_bob`)、`r` 為單位矩陣 —— 相機已經移除畸變,沒有東西需要還原。
+
+`L+R` 與 `L+R+D` 模式在彩色 topic 上發布的是原始感測器影像。那裡的
+`k` 與 `d` 是發布解析度下的原廠鏡頭模型、`r` 是校正旋轉,`image_proc`
+可以正常校正它們。請讀 `distortion_model` 而不要假設係數個數:driver 會回報
+`rational_polynomial` 八個係數或 `plumb_bob` 五個,依該台模組內
+儲存的校正資料而定。
+
+兩種情況下 `p` 都是投影矩陣,也是姿態估計(AprilTag、PnP、SLAM)應該
+取用的內參來源。立體對的右相機 `p[3]` 是 `-fx × 基線`,單位為公尺。
 
 ### 訂閱端 QoS
 
@@ -88,20 +124,20 @@ self.create_subscription(Image, topic, callback, qos_profile=qos_profile_sensor_
 為了同時取得「不含 IR 紅外點的 color」與「高品質的 depth」，
 eYs3D 提出 Interleave 模式來達到此需求：
 
-- **偶數 frame —— IR 關閉 → `/left_color`**。
+- **偶數 frame —— IR 關閉 → `/left_color/image_raw`**。
   沒有 IR 紅外點干擾，輸出乾淨的 RGB 影像。
-- **奇數 frame —— IR 開啟 → `/depth_image`**。
+- **奇數 frame —— IR 開啟 → `/depth/image_raw`**。
   IR 紅外點為立體匹配提供結構特徵，得到較高品質的深度。
 
 驅動在 SDK 串流源頭做奇偶 frame 過濾，因此每條串流的 FPS 會減半。
 
 #### 時戳影響
 
-以 G100+ 預設 `mode_id=1` 為例：
+以 G100+ 在 USB 3.0 下的預設 `mode_id=1` 為例：
 
 ```
-sensor 60 fps  ──SDK interleave──>  /G100P_1/left_color   30 fps
-                                 └  /G100P_1/depth_image  30 fps
+sensor 60 fps  ──SDK interleave──>  /G100P_1/left_color/image_raw  30 fps
+                                 └  /G100P_1/depth/image_raw       30 fps
 ```
 
 color 與 depth **來自相鄰兩張 sensor frame**，stamp 相差
@@ -113,7 +149,7 @@ sensor frame 週期（例如 20 ms）即可穩定配對。
 
 #### 影響的 mode IDs
 
-於 `launch/video_modes/G100P.yaml` 中，**`mode_id` 1、3、5、7–21** 為 interleave。
+於 `launch/video_modes/G100P.yaml` 中，**`mode_id` 1、3、5、7–21、56、57** 為 interleave。
 其他 mode 為 color 與 depth 同時擷取，stamp 一致。
 
 ---
@@ -137,26 +173,28 @@ ros2 launch eys3d_camera G62.launch.py   mode_id:=3    # G62:L'+D 320x240 @ 30 f
 | 參數 | 預設值 | 說明 |
 |---|---|---|
 | `camera_name` | `<MODEL>_1` | ROS namespace 與 frame-id 前綴 |
-| `mode_id` | `1` | video mode 列表中的索引 |
+| `mode_id` | `-1` | video mode 列表中的索引;`-1` = 自動(依協商到的 USB 速度取該 signature 的預設) |
 | `dev_serial_number` | `""` | 以序號子字串綁定 |
 | `usb_port` | `""` | 以 USB 拓樸路徑綁定，例如 `2-3:1.0` |
-| `depth_minimum_mm` | `-1` | 同時套用到 `/depth_image` 與 `/pointcloud` 的距離下限，低於此值的像素歸零。`-1` = 該型號預設（G100+ 250、R77 200、G62 100）|
-| `depth_maximum_mm` | `-1` | 同時套用到 `/depth_image` 與 `/pointcloud` 的距離上限，高於此值的像素歸零。`-1` = 該型號預設（G100+ 1900、R77/G62 1500）|
+| `depth_near_mm` | `-1` | 同時套用到 `/depth/image_raw` 與 `/depth/points` 的距離下限，低於此值的像素歸零。`-1` = 該型號預設（G100+ 250、R77 200、G62 100）|
+| `depth_far_mm` | `-1` | 同時套用到 `/depth/image_raw` 與 `/depth/points` 的距離上限，高於此值的像素歸零。`-1` = 該型號預設（G100+ 1900、R77/G62 1500）|
 | `colored_pointcloud` | `false` | 從最近一張左目彩色幀取色，輸出 XYZRGB PointCloud2；depth-only mode 自動回退為 XYZ |
 | `spatial_filter` | `false` | 啟用視差域邊緣感知 IIR 空間濾波器（布林開關）|
 | `temporal_filter` | `false` | 啟用時間濾波器，alpha 混合 + persistence（布林開關，執行中可調）|
 | `hole_filling` | `0` | Z 域補洞模式。`0` = 關閉、`1` = fill_from_left、`2` = farthest_from_around、`3` = nearest_from_around（為整數模式，非布林）|
 | `filter_profile` | `default` | 濾波器調校設定檔名稱；解析至 `cfg/filter_profiles/<name>.yaml`，啟動時載入濾波器調校值 |
-| `ir_intensity` | `-1` | `-1` = 該型號預設值（G100+ / R77 = 3、G62 = 60）；`0` = 關閉；正整數覆寫至 FW 範圍（G100+ 0-9、R77 0-6、G62 0-96）|
+| `ir_value` | `-1` | `-1` = 依模式決定：mode 含深度或機型為黑白（G62 / R77）時採型號預設值（G100+ / R77 = 3、G62 = 60），彩色感光元件跑純彩色 mode 時關閉；`0` = 關閉；正整數覆寫至 FW 範圍（G100+ 0-6、R77 0-6、G62 0-96）|
 | `log` | `sdk`（per-model）/ `all`（generic） | 終端輸出層級。`all` = RCLCPP + SDK 完整輸出；`sdk` = 抑制 RCLCPP INFO/DEBUG，保留 WARN/ERROR 與 SDK printf；`close` = 全部導向 per-process log 檔（終端靜默）|
+| `urdf` | `true` | 透過 namespace 隔離的 `robot_state_publisher` 在 `<camera_name>/robot_description` 發布相機模型（mesh + 鎖固孔 frame）。若整機 bringup 已含相機描述，設為 `false` |
 | `rviz` | `true` | 是否自動開啟 RViz |
+| `selfcal_enable` | `false` | 啟用選用的自我校正;`true` 會啟用 `selfcal/run` action 與 `selfcal/commit` service（詳見自我校正段落）。僅 launch 時可設 |
 
 彩色串流是否切分為 `left_color` 與 `right_color` 由選定的 video mode 決定（`launch/video_modes/<MODEL>.yaml` 的 `split_lr` 旗標），並非由 launch 參數控制。
 
 ### 影像參數控制
 
-所有 eYs3D 模組出廠預設 `enable_auto_exposure` 開啟、
-`enable_auto_white_balance` 開啟、`power_line_frequency` 設為
+所有 eYs3D 模組出廠預設 `auto_exposure` 開啟、
+`auto_white_balance` 開啟、`power_line_frequency` 設為
 60 Hz；驅動程式僅承襲韌體開機時的設定，**只有當操作者明確覆寫時
 才寫回相機**，所以在 ROS 之外調整過的設定能跨重啟保留。IR 是例外，
 因為相機開機後投射器預設為關閉，因此一定會套用。
@@ -164,12 +202,14 @@ ros2 launch eys3d_camera G62.launch.py   mode_id:=3    # G62:L'+D 320x240 @ 30 f
 執行中即可調整，毋需重啟：
 
 ```bash
-ros2 param set /G100P_1/eys3d_camera ir_intensity         5
-ros2 param set /G100P_1/eys3d_camera enable_auto_exposure      false   # 手動曝光
-ros2 param set /G100P_1/eys3d_camera exposure_time_step        -8
-ros2 param set /G100P_1/eys3d_camera enable_auto_white_balance false
+ros2 param set /G100P_1/eys3d_camera ir_value             5
+ros2 param set /G100P_1/eys3d_camera auto_exposure        false   # 手動曝光
+ros2 param set /G100P_1/eys3d_camera exposure_time_step   -8
+ros2 param set /G100P_1/eys3d_camera auto_white_balance   false
 ros2 param set /G100P_1/eys3d_camera power_line_frequency 1       # 1 = 50 Hz、2 = 60 Hz
 ```
+
+`exposure_time_step` 接受 **[-13, 3]** 範圍內的帶號整數（log2 曝光暫存器），且僅在 `auto_exposure` 為 `false` 時生效。
 
 ### 後處理濾波器
 
@@ -210,8 +250,9 @@ ros2 param set /G100P_1/eys3d_camera temporal_filter_persistence 3
 
 ### 執行時串流控制
 
-兩個 service 可以暫停或停止相機輸出，而不需要關掉 ROS node。
-兩者都會同時控制 color 與 depth。
+三個 service 可以控制相機輸出,而不需要關掉 ROS node。`pause` 與
+`standby` 接收 `std_srvs/srv/SetBool`,同時控制 color 與 depth;
+`hw_reset` 接收 `std_srvs/srv/Empty`,透過 USB 對相機做硬體重置。
 
 ```bash
 # 停止發布 frame,但相機仍在 USB 上 stream。Driver CPU 降到接近 0,
@@ -220,10 +261,15 @@ ros2 service call /G100P_1/pause   std_srvs/srv/SetBool "{data: true}"
 ros2 service call /G100P_1/pause   std_srvs/srv/SetBool "{data: false}"
 
 # 完全釋放 USB pipe。ROS node 仍然活著，topic 仍然註冊。
-# resume 約 300 ms 重新打開相機。適合需要把 USB 頻寬讓給其他
+# resume 會重新打開相機，依機種需要數秒。適合需要把 USB 頻寬讓給其他
 # 裝置的情境。
 ros2 service call /G100P_1/standby std_srvs/srv/SetBool "{data: true}"
 ros2 service call /G100P_1/standby std_srvs/srv/SetBool "{data: false}"
+
+# 透過 USB 重置相機(重新列舉裝置)。node 會停止串流、發出重置,
+# 之後 watchdog 自動重連,frame 通常在約 12 秒後恢復。用於在不重啟
+# node 的情況下復原卡死的相機。
+ros2 service call /G100P_1/hw_reset std_srvs/srv/Empty
 ```
 
 Standby 生效期間，自動重連 watchdog(下一節)會把無訊號視為刻意行為，
@@ -232,17 +278,16 @@ Standby 生效期間，自動重連 watchdog(下一節)會把無訊號視為刻�
 
 ### 熱插拔自動復原
 
-驅動內建 1 Hz watchdog。當 color **與** depth 連續 **3 秒**沒有任何
-幀進來（啟動時放寬到 10 秒），watchdog 會關閉裝置進入重連迴圈，
-每 2 秒嘗試一次。相機重新接回後，原本的 topic 會自動恢復發布 —
-**不需要重跑 `ros2 launch`**。
+驅動內建 1 Hz watchdog，每個串流各自監看：某個串流送出過影格之後，
+若連續 **3 秒**沒有新影格，就關閉裝置進入重連迴圈，每 2 秒嘗試一次 ——
+因此 depth 在韌體裡卡住、color 仍持續送的情況也能復原。第一個影格
+進來之前門檻放寬為 10 秒，足以涵蓋 R77 7 fps 這類慢速模式。相機重新
+接回後，原本的 topic 會自動恢復發布，**不需要重跑 `ros2 launch`**。
 
 ```
-[ERROR] watchdog: no frames for 3 s — declaring camera disconnected
+[ERROR] watchdog: depth stream silent for 3 s; declaring camera disconnected
 [INFO]  watchdog: reconnect succeeded after 2 attempt(s)
 ```
-
-慢速模式（例如 R77 7 fps）由 10 秒啟動寬限期吸收；一旦觀察到任一幀，
 就改套用 3 秒的穩態判定門檻。
 
 ### 多相機
@@ -268,9 +313,9 @@ ros2 launch eys3d_camera G100P.launch.py \
 請依實際接線改寫後再啟動:
 
 ```bash
-ros2 launch eys3d_camera examples/dual_G62.launch.py
-ros2 launch eys3d_camera examples/dual_G100P.launch.py
-ros2 launch eys3d_camera examples/G100P_plus_R77.launch.py
+ros2 launch eys3d_camera dual_G62.launch.py
+ros2 launch eys3d_camera dual_G100P.launch.py
+ros2 launch eys3d_camera G100P_plus_R77.launch.py
 ```
 
 內建的多相機範例已預先選好較輕的 `mode_id`,確保兩台相機能在 USB
@@ -290,17 +335,34 @@ ros2 launch eys3d_camera examples/G100P_plus_R77.launch.py
 REP-103 `_optical_frame`。PointCloud2 使用 `<camera_name>_points_frame`，
 已轉至 ROS 基底軸，無須再旋轉。
 
-整合到機器人 URDF 時，將 `<camera_name>_link` 掛在既有 frame 之下即可。
-最小範例（請依平台調整 `parent_link`、joint 名稱與掛載姿態）:
+每個型號皆隨附含 3D mesh 的 URDF/xacro 描述檔
+（`urdf/eys3d_<MODEL>.urdf.xacro` + `meshes/<MODEL>.dae`）。`<name>_link`
+位於深度起始點 —— 兩顆感光元件的橫向中點、光軸高度上，距相機前殼面
+內縮 Z'（G100+ 6.75 mm、R77 4.8 mm、G62 3.1 mm）。在機器人既有 frame
+之下以實際掛載姿態實例化 macro：
 
 ```xml
-<joint name="g100p_mount" type="fixed">
-  <parent link="parent_link"/>
-  <child  link="G100P_1_link"/>
+<xacro:include filename="$(find eys3d_camera)/urdf/eys3d_G100P.urdf.xacro"/>
+<xacro:eys3d_G100P name="G100P_1" parent="parent_link">
   <origin xyz="0.10 0.00 0.05" rpy="0 0 0"/>
-</joint>
-<link name="G100P_1_link"/>
+</xacro:eys3d_G100P>
 ```
+
+單獨預覽（`name` 預設為 `<MODEL>_1`，與驅動程式及隨附 rviz 佈局一致）：
+
+```bash
+ros2 launch eys3d_camera display_model.launch.py model:=G100P
+```
+
+並排預覽三款模型（不需硬體）:
+
+```bash
+ros2 launch eys3d_camera three_models.launch.py
+```
+
+每份描述檔同時帶有機殼鎖固孔 frame（`<name>_tripod_frame` 與
+`<name>_back/bottom_screw*_frame`，位置取自原廠 CAD），供機構
+整合時核對虛擬與實體的一致性。
 
 驅動程式以 `TRANSIENT_LOCAL` durability 將相機 TF 樹一次性發布到
 `/tf_static`,任何後加入的訂閱者都會立即收到快取的 transform。
@@ -315,7 +377,7 @@ REP-103 `_optical_frame`。PointCloud2 使用 `<camera_name>_points_frame`，
 以指標方式交給同容器訂閱者，而非經 DDS 傳遞。
 
 ```bash
-ros2 launch eys3d_camera examples/G100P_composable.launch.py \
+ros2 launch eys3d_camera G100P_composable.launch.py \
     use_intra_process_comms:=true
 ```
 
@@ -339,9 +401,10 @@ task 一個),名稱為 `"<hardware_id>: <task>"`(`hardware_id` 為相機序號,
 
 | `level` | `message` | 意義 |
 |---|---|---|
-| `OK` | `streaming OK` | 每條啟用的串流都達到預期 fps 的 50 % 以上 |
-| `WARN` | `one stream below 50% of expected fps` | 某條串流速度過低 |
-| `ERROR` | `no frames flowing on enabled streams` | 啟用的串流都低於門檻（或皆無資料） |
+| `OK` | `streaming` | 每條設定中的串流都有在送 |
+| `OK` | `streaming (paused — publish gated by operator)` | `pause` 生效中 |
+| `OK` | `standby (USB pipe closed by operator)` | `standby` 生效中 |
+| `ERROR` | `no frames flowing on any configured stream` | 每條設定中的串流都低於預期速率的一半 |
 | `ERROR` | `camera disconnected; Linux device node not present` | USB 斷線；watchdog 會在裝置回插時自動重連 |
 
 各 task 的 `values` 鍵值對：
@@ -370,11 +433,14 @@ task 一個),名稱為 `"<hardware_id>: <task>"`(`hardware_id` 為相機序號,
 | `decode_avg_ms` | （僅 `color`）過去 1 秒 color 解碼平均耗時。當下 1 秒內有解碼過 frame 才會出現 |
 | `decode_max_ms` | （僅 `color`）至今觀察到的最長 color 解碼耗時。曾經解碼過 frame 才會出現 |
 
+兩者的摘要為 `streaming`、`input rate below 50% of expected`（WARN）、
+`not configured (D-only mode)` 或 `standby`。
+
 **`pointcloud`** — 點雲投影 + 後處理計數：
 
 | Key | 說明 |
 |---|---|
-| `compute_status` | `active`（有訂閱者拉點雲）、`idle (no /pointcloud subscriber)`、`idle (never run ; no subscriber since start)` 或 `(disconnected — see device task)` |
+| `compute_status` | `active`（有訂閱者拉點雲）、`idle (no /depth/points subscriber)`、`idle (never run ; no subscriber since start)` 或 `(disconnected — see device task)` |
 | `publish_fps` | 過去 1 秒點雲發布幀數。沒訂閱者時為 0 |
 | `compute_avg_ms` | 過去 1 秒點雲計算平均耗時（`active` 時出現）|
 | `compute_max_ms` | 至今觀察到的最長點雲計算耗時 |
@@ -385,7 +451,7 @@ task 一個),名稱為 `"<hardware_id>: <task>"`(`hardware_id` 為相機序號,
 
 | Key | 說明 |
 |---|---|
-| `temperature_c` | 晶片溫度（°C）；不支援的機型顯示 `n/a (not supported on this model)` |
+| `temperature_c` | 晶片溫度（°C）。僅在機型具備感測器且讀取成功時發布；否則不會出現此欄位，原因寫在該任務的 summary |
 
 `/diagnostics` 只在有訂閱者連線時才會組裝並發布訊息；hot-path 的
 atomic counter 持續累計，所以隨時掛上監控都能看到自 open 起的累積值。
@@ -411,6 +477,118 @@ ros2 run eys3d_camera perf_monitor --ns /G100P_1 --interval 0.5
 
 ---
 
+## 自我校正
+
+選用的串流中自我校正會重新對齊立體視覺配對,在校正已漂移的模組上恢復深度
+填充率。預設即編入(CMake `EYS3D_WITH_SELFCAL`),並於 launch 時以
+`selfcal_enable:=true` 啟用。
+
+```bash
+ros2 launch eys3d_camera G100P.launch.py selfcal_enable:=true
+```
+
+執行時相機需**正在串流深度模式,並對準工作距離下一般、有紋理的場景** ——
+校正器以深度覆蓋率為量測依據,因此需要有效深度。一個 `selfcal/run` action
+即執行完整一次 session,並自動套用內建的調校參數。
+
+```bash
+# 執行一次 session(阻塞直到收斂,約 20-30 秒,接著一段短暫複檢;--feedback
+# 會串流 phase / progress)。auto_commit_shift_px < 0 會讓結果生效但永不寫 flash;
+# >= 0 則在此次「驗證為更好」且 cy 位移達到這麼多像素時自動燒錄(詳見下表)。
+ros2 action send_goal /G100P_1/selfcal/run \
+  eys3d_camera_interfaces/action/SelfCal \
+  "{auto_commit_shift_px: 0.25}" --feedback
+
+# 將保留的結果寫入 flash(僅在未自動燒錄時需要)。
+# 檢查回應的 `success` 欄位 —— 若沒有可保留的結果會是 false。
+ros2 service call /G100P_1/selfcal/commit std_srvs/srv/Trigger
+```
+
+搜尋結束後,此次會依校正器的 outcome **加上一次即時 A/B 複檢**自行收尾 ——
+複檢在同一場景量測「新對齊 vs 跑之前對齊」的深度填充率,因此判定反映真實的
+前後差異,而非場景相依的臆測:
+
+- **驗證為更好** —— 複檢確認的 `SUCCESS`,已生效(`applied: true`)。若有設
+  `auto_commit_shift_px` 且 `cy_shift_px` 達標,此次即**燒錄**進 flash
+  (`committed: true`);否則**保留生效**但為暫存 —— 呼叫 `selfcal/commit`
+  才能在斷電後留存。
+- **已是最佳**(`NO_CHANGE`)—— 不改動、不保留、不寫入。這是正常且健康的結果。
+- **更差 / 無法驗證 / 失敗** —— 複檢判定更差或無法確認(例如跑的過程中相機
+  移動了),或 `INSUFFICIENT_INPUT` / `TIMEOUT` / `FAILED` —— 相機**還原**回
+  跑之前的對齊(`reverted: true`)。
+
+`cy_shift_px` 是實測的垂直位移,直接讀自硬體,也是自動燒錄門檻採用的值。步階
+固定在 **0.25 px**,位移上限為 **5.0 px**,所以它永遠是 `0.25、0.50、… 5.00`
+其中之一(或 `0`)。`auto_commit_shift_px` 是門檻 —— 可帶任何值,但只有步階
+邊界會改變行為,介於步階之間的值會向上取整(`0.3` 等同 `0.5`):
+
+| `auto_commit_shift_px` | 效果 |
+| --- | --- |
+| `-1`(預設)| 永不自動燒 —— 檢視後手動燒錄。未帶此參數時採用的預設值 |
+| `0.25` | 任何真實移動(≥ 1 步)就燒 —— **建議值** |
+| `0.50`、`0.75`、… 直到 `5.00` | 要求更大的位移才燒 |
+| `> 5.0` | 永不觸發(位移不可能超過上限)|
+
+### Action 回饋
+
+此次執行進行中,若 goal 以 `--feedback` 送出,便會持續串流:
+
+| 欄位 | 意義 |
+| --- | --- |
+| `phase` | `INITIAL_SEARCH` / `REFINEMENT` / `RECHECK` / `COMPLETED` |
+| `progress` | 搜尋進度,`0.0`–`1.0` |
+| `processed_frames` | 至今餵給校正器的深度幀數 |
+| `valid_ratio_latest` | 最新一幀的填充率(有結果後才有值)|
+
+### Action 結果
+
+無法啟動、無法得出結論、或無法回退已否決的變更時，goal 會 abort；刻意的
+revert 則是 succeed。兩種情況的細節都在 `outcome`。
+
+此次執行收尾時回傳一次 —— 記錄這次 session 量到了什麼、又在相機上留下了什麼:
+
+| 欄位 | 意義 |
+| --- | --- |
+| `outcome` | `SUCCESS` / `NO_CHANGE` / `INSUFFICIENT_INPUT`(場景中有效深度不足)/ `TIMEOUT`(未在時限內收斂)/ `FAILED` |
+| `cy_shift_px` | 實測垂直 cy 位移(px)—— 自動燒錄門檻依據 |
+| `recheck_verdict` | A/B 複檢:`improved` / `worse` / `inconclusive` / `skipped` |
+| `recheck_ratio_before` / `recheck_ratio_after` | 複檢時「跑前 / 收斂後」對齊的填充率 |
+| `applied` | 修正已生效於暫存器 |
+| `reverted` | 已還原回跑前校正 |
+| `committed` | 已寫入使用者校正區 |
+| `message` | 結果的人類可讀摘要 |
+| `correction_level`、`valid_ratio_first` / `_latest` / `_delta` | 僅供診斷(永不作為燒錄門檻)|
+
+整個 session 全程串流:深度持續發布、任何後處理濾鏡持續運作 —— 此次執行從不
+重啟串流。搜尋期間深度品質會隨校正器探測各對齊而明顯波動,收斂後便穩定下來。
+session **無法中斷**(cancel 一律拒絕,控制設定項與 `pause` / `standby` /
+`hw_reset` 也會拒絕)—— 它很短,且結果更差時會自動還原,所以沒有需要中斷的
+情形。
+
+`commit` 是唯一寫入 flash 的步驟;原廠校正保留作為備份,永不被覆寫。**保留但
+未燒錄**的結果只存在於相機暫存器,斷電重開或呼叫 `~/hw_reset` 就會清回已儲存
+的校正。這讓「在串流上校正、永不寫 flash」是預設就安全的流程 —— 每當機器人
+停靠且靜止時執行即可。
+
+有兩點值得注意:
+
+- **連續執行會疊加。** 在 commit 或斷電重開之前再跑一次 `selfcal/run`,是接
+  著上一次保留的結果繼續、而不是從 flash 重來。想要乾淨的基準,請先 `commit`
+  或斷電重開。
+- **不符資格 / 已有 session 在跑 → 是拒絕,不是失敗。** 不支援自我校正的模組,
+  以及已有 session 在跑時再送出的第二個 `selfcal/run`,都會直接被拒絕 ——
+  `ros2 action send_goal` 回報「Goal was rejected」(沒有 `Result`),原因要看
+  node log。
+
+**每個 process 同時只能有一次 session。** 校正器將相機 handle 綁在 process 全域,
+因此共用同一 process 的相機 —— 例如同一個 `ComposableNodeContainer` 內的多個
+driver —— 只能一次校正一台;在第一次結束之前,第二個 `selfcal/run` 會被拒絕並在
+node log 留下訊息。以獨立 process 啟動的相機則不受影響。除此之外,intra-process
+通訊與此無關:校正器會自行複製一份深度 frame,因此執行期間
+`use_intra_process_comms` 的傳遞方式不變。
+
+---
+
 ## 疑難排解
 
 | 問題 | 解法 |
@@ -424,18 +602,12 @@ ros2 run eys3d_camera perf_monitor --ns /G100P_1 --interval 0.5
 ### 訂閱端收到的 fps 比 driver 公布的少
 
 `perf_monitor` 或 `ros2 topic hz` 顯示 Rx < Pub，但 `/diagnostics`
-顯示 `dropped = 0`，這是 DDS 傳輸層在掉，不是 driver。
+顯示 `input_dropped = 0`，這是 DDS 傳輸層在掉，不是 driver。
 
 各個支援的 video mode 之單張影像都比 kernel UDP socket 與 IP
 fragment reassembly 在一次 burst 內所能吸收的量大(`rgb8` 1280×720
-≈ 2.7 MB；典型 point cloud 最多 ~11 MB)。同一個底層原因(kernel 端
-buffer 撐爆)會在兩種情境中以不同表象出現：
-
-- **效能較高的 x86 主機**:driver 把每張 frame 在微秒級的 UDP
-  fragment burst 內塞給 DDS，接收端 socket / reassembly queue 還沒
-  消化就溢位。
-- **運算資源受限的 ARM 主機**:receiver 端讀同一個 kernel buffer
-  的速度太慢，buffer 提早滿，結果一樣。
+≈ 2.7 MB；典型 point cloud 最多 ~11 MB)，因此 kernel 端 buffer 會
+溢位 —— 不論是 x86 主機送得太快、還是 ARM 主機讀得太慢。
 
 package 附了一份 opt-in 腳本，把 FastRTPS 切到 32 MB 的 shared-
 memory segment，可消除任何**同機**訂閱者的 UDP fragmentation 問題。
